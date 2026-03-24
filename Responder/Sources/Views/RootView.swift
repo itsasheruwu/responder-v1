@@ -3,11 +3,12 @@ import SwiftUI
 struct RootView: View {
     @Bindable var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         ZStack {
             NavigationSplitView {
-                ConversationListView(model: model)
+                ConversationContextView(model: model)
             } content: {
                 ConversationDetailView(model: model)
             } detail: {
@@ -24,6 +25,9 @@ struct RootView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 } else if model.showsOnboarding {
                     OnboardingView(model: model)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                } else if model.showsConversationChooser {
+                    StartupConversationPickerView(model: model)
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
             }
@@ -58,6 +62,10 @@ struct RootView: View {
 
                 Button("Setup") {
                     Task { await model.reopenOnboarding() }
+                }
+
+                Button("Settings") {
+                    openSettings()
                 }
 
                 Toggle(isOn: Binding(
@@ -95,48 +103,76 @@ struct RootView: View {
     }
 
     private var overlayActive: Bool {
-        model.showsPermissionGate || model.showsOnboarding
+        model.showsPermissionGate || model.showsOnboarding || model.showsConversationChooser
     }
 }
 
-struct ConversationListView: View {
+struct ConversationContextView: View {
     @Bindable var model: AppModel
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        List(selection: $model.selectedConversationID) {
-            ForEach(model.conversations) { conversation in
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(conversation.title)
-                            .font(.headline)
-                        Spacer()
-                        Text(conversation.service.rawValue)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(conversation.lastMessagePreview)
-                        .lineLimit(2)
-                        .foregroundStyle(.secondary)
-                    HStack {
-                        if conversation.unreadCount > 0 {
-                            Text("\(conversation.unreadCount) unread")
-                                .font(.caption2)
-                                .foregroundStyle(.tint)
-                        }
-                        if let date = conversation.lastMessageDate {
-                            Spacer()
-                            Text(date, style: .time)
-                                .font(.caption2)
+        Group {
+            if let conversation = model.selectedConversation {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Active Context")
+                                .font(.title3.weight(.semibold))
+                            Text("Responder stays scoped to one conversation at a time.")
                                 .foregroundStyle(.secondary)
                         }
+
+                        GroupBox("Conversation") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(conversation.title)
+                                    .font(.headline)
+                                Text(conversation.subtitle)
+                                    .foregroundStyle(.secondary)
+                                Text("Service: \(conversation.service.rawValue)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if conversation.unreadCount > 0 {
+                                    Text("\(conversation.unreadCount) unread message(s)")
+                                        .font(.caption)
+                                        .foregroundStyle(.tint)
+                                }
+                                if let date = conversation.lastMessageDate {
+                                    Text("Last activity: \(date.formatted(date: .abbreviated, time: .shortened))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                        GroupBox("Launch Behavior") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(model.persistConversationSelectionAcrossLaunches
+                                     ? "Responder will reopen this conversation automatically on launch."
+                                     : "Responder will ask you to choose a conversation each time it launches.")
+                                Button("Change Conversation in Settings") {
+                                    openSettings()
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+
+                        GroupBox("Recent Preview") {
+                            Text(conversation.lastMessagePreview)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
+                    .padding()
                 }
-                .tag(conversation.id)
+            } else {
+                ContentUnavailableView(
+                    "No Conversation Selected",
+                    systemImage: "message",
+                    description: Text("Choose a conversation on launch or open Settings to change the active context.")
+                )
             }
-        }
-        .onChange(of: model.selectedConversationID, initial: true) {
-            guard let id = model.selectedConversationID else { return }
-            Task { await model.loadConversation(id: id) }
         }
     }
 }
@@ -198,7 +234,11 @@ struct ConversationDetailView: View {
                 }
                 .padding()
             } else {
-                ContentUnavailableView("No Conversation Selected", systemImage: "message")
+                ContentUnavailableView(
+                    "No Conversation Selected",
+                    systemImage: "message",
+                    description: Text("Responder needs one conversation selected before it can load history and generate replies.")
+                )
             }
         }
     }
@@ -306,6 +346,78 @@ struct ReplyInspectorView: View {
         }
         .onChange(of: draftText) { _, newValue in
             model.scheduleDraftSave(newValue)
+        }
+    }
+}
+
+struct StartupConversationPickerView: View {
+    @Bindable var model: AppModel
+
+    @State private var pendingConversationID: String?
+    @State private var persistAcrossLaunches = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Choose Conversation Context")
+                    .font(.largeTitle.weight(.semibold))
+                Text("Responder now works with one conversation at a time. Pick the conversation you want it to use for history, memory, and draft generation.")
+                    .foregroundStyle(.secondary)
+            }
+
+            List(model.conversations, selection: $pendingConversationID) { conversation in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(conversation.title)
+                            .font(.headline)
+                        Spacer()
+                        Text(conversation.service.rawValue)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(conversation.lastMessagePreview)
+                        .lineLimit(2)
+                        .foregroundStyle(.secondary)
+                    Text(conversation.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+                .tag(conversation.id)
+            }
+            .frame(minHeight: 320)
+
+            Toggle("Always reopen this conversation on launch", isOn: $persistAcrossLaunches)
+
+            HStack {
+                Text("You can change the active conversation later in Settings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button("Use Conversation") {
+                    guard let pendingConversationID else { return }
+                    Task {
+                        await model.activateConversation(
+                            pendingConversationID,
+                            persistAcrossLaunches: persistAcrossLaunches
+                        )
+                    }
+                }
+                .disabled(pendingConversationID == nil)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(28)
+        .frame(width: 780, height: 620, alignment: .topLeading)
+        .background(.thickMaterial, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .shadow(radius: 30)
+        .task {
+            if pendingConversationID == nil {
+                pendingConversationID = model.conversationLaunchPreference.conversationID ?? model.conversations.first?.id
+            }
+            persistAcrossLaunches = model.persistConversationSelectionAcrossLaunches
         }
     }
 }

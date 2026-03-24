@@ -119,6 +119,16 @@ struct SelectedModelState: Hashable, Codable, Sendable {
     let model: OllamaModelInfo
 }
 
+struct ConversationLaunchPreference: Hashable, Codable, Sendable {
+    var conversationID: String?
+    var persistSelectionAcrossLaunches: Bool
+
+    static let `default` = ConversationLaunchPreference(
+        conversationID: nil,
+        persistSelectionAcrossLaunches: false
+    )
+}
+
 struct PromptLayer: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let title: String

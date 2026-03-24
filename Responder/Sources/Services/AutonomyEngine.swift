@@ -159,7 +159,7 @@ actor AutonomyEngine: AutonomyCoordinating {
         )
     }
 
-    func monitorCycle(modelName: String) async throws -> [ActivityLogEntry] {
+    func monitorCycle(modelName: String, activeConversationID: String?) async throws -> [ActivityLogEntry] {
         let global = try await database.loadGlobalSettings()
         guard global.autonomyEnabled, !global.emergencyStopEnabled else {
             return []
@@ -169,6 +169,9 @@ actor AutonomyEngine: AutonomyCoordinating {
         var entries: [ActivityLogEntry] = []
 
         for config in configs where config.monitoringEnabled {
+            if let activeConversationID, config.conversationID != activeConversationID {
+                continue
+            }
             guard let latest = try await store.latestCursor(conversationID: config.conversationID) else { continue }
             let previous = try await database.loadMonitorCursor(conversationID: config.conversationID)
             if latest.lastMessageID == previous?.lastMessageID {

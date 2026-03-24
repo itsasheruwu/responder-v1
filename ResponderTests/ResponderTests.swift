@@ -186,6 +186,19 @@ final class ResponderTests: XCTestCase {
         }
     }
 
+    func testConversationLaunchPreferencePersists() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let preference = ConversationLaunchPreference(
+            conversationID: "chat-123",
+            persistSelectionAcrossLaunches: true
+        )
+
+        try await database.saveConversationLaunchPreference(preference)
+        let loaded = try await database.loadConversationLaunchPreference()
+
+        XCTAssertEqual(loaded, preference)
+    }
+
     func testScheduledDraftSavePersistsLatestTextOnly() async throws {
         let database = try AppDatabase(inMemory: true)
         let previewLLM = PreviewOllamaClient()
@@ -270,31 +283,110 @@ final class ResponderTests: XCTestCase {
         try await database.saveAutonomyConfig(config)
 
         await messagesStore.setLatest(MonitorCursor(conversationID: conversation.id, lastMessageID: "incoming-1", lastMessageDateValue: 1))
-        _ = try await autonomy.monitorCycle(modelName: "model")
+        _ = try await autonomy.monitorCycle(modelName: "model", activeConversationID: conversation.id)
         let firstCallCount = await messagesStore.currentFetchConversationCallCount()
         XCTAssertEqual(firstCallCount, 1)
         let firstCursor = try await database.loadMonitorCursor(conversationID: conversation.id)
         XCTAssertEqual(firstCursor?.lastMessageID, "incoming-1")
 
         await messagesStore.setLatest(MonitorCursor(conversationID: conversation.id, lastMessageID: "incoming-1", lastMessageDateValue: 2))
-        _ = try await autonomy.monitorCycle(modelName: "model")
+        _ = try await autonomy.monitorCycle(modelName: "model", activeConversationID: conversation.id)
         let unchangedCallCount = await messagesStore.currentFetchConversationCallCount()
         XCTAssertEqual(unchangedCallCount, 1)
 
         await messagesStore.setLatest(MonitorCursor(conversationID: conversation.id, lastMessageID: "incoming-2", lastMessageDateValue: 3))
         await messagesStore.setFailFetchConversation(true)
         await XCTAssertThrowsErrorAsync {
-            _ = try await autonomy.monitorCycle(modelName: "model")
+            _ = try await autonomy.monitorCycle(modelName: "model", activeConversationID: conversation.id)
         }
         let retryCursor = try await database.loadMonitorCursor(conversationID: conversation.id)
         XCTAssertEqual(retryCursor?.lastMessageID, "incoming-1")
 
         await messagesStore.setFailFetchConversation(false)
-        _ = try await autonomy.monitorCycle(modelName: "model")
+        _ = try await autonomy.monitorCycle(modelName: "model", activeConversationID: conversation.id)
         let finalCallCount = await messagesStore.currentFetchConversationCallCount()
         XCTAssertEqual(finalCallCount, 3)
         let finalCursor = try await database.loadMonitorCursor(conversationID: conversation.id)
         XCTAssertEqual(finalCursor?.lastMessageID, "incoming-2")
+    }
+
+    func testMonitorCycleSkipsInactiveConversationSelection() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let llm = PreviewOllamaClient()
+        let primaryConversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+        let secondaryConversation = ConversationRef(
+            id: "c2",
+            title: "Taylor",
+            service: .iMessage,
+            participants: [Participant(handle: "taylor@example.com", displayName: "Taylor", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+        let messagesStore = MultiConversationMonitorMessagesStore(conversations: [
+            primaryConversation.id: primaryConversation,
+            secondaryConversation.id: secondaryConversation
+        ])
+        let autonomy = AutonomyEngine(
+            store: messagesStore,
+            sender: PreviewMessagesSender(),
+            contextManager: ContextManager(),
+            summarizer: Summarizer(ollama: llm, database: database),
+            memory: MemoryEngine(database: database),
+            policy: PolicyEngine(ollama: llm, database: database),
+            database: database,
+            ollama: llm
+        )
+
+        try await database.saveGlobalSettings(GlobalAutonomySettings(
+            autonomyEnabled: true,
+            emergencyStopEnabled: false,
+            defaultQuietHoursStartHour: 22,
+            defaultQuietHoursEndHour: 7,
+            defaultConfidenceThreshold: 0.88,
+            defaultMinimumMinutesBetweenSends: 30,
+            defaultDailySendLimit: 5,
+            monitorPollIntervalSeconds: 15
+        ))
+
+        var primaryConfig = AutonomyContactConfig.default(
+            conversationID: primaryConversation.id,
+            memoryKey: primaryConversation.memoryKey
+        )
+        primaryConfig.monitoringEnabled = true
+        try await database.saveAutonomyConfig(primaryConfig)
+
+        var secondaryConfig = AutonomyContactConfig.default(
+            conversationID: secondaryConversation.id,
+            memoryKey: secondaryConversation.memoryKey
+        )
+        secondaryConfig.monitoringEnabled = true
+        try await database.saveAutonomyConfig(secondaryConfig)
+
+        await messagesStore.setLatest(
+            MonitorCursor(conversationID: primaryConversation.id, lastMessageID: "incoming-1", lastMessageDateValue: 1),
+            for: primaryConversation.id
+        )
+        await messagesStore.setLatest(
+            MonitorCursor(conversationID: secondaryConversation.id, lastMessageID: "incoming-2", lastMessageDateValue: 2),
+            for: secondaryConversation.id
+        )
+
+        _ = try await autonomy.monitorCycle(modelName: "model", activeConversationID: primaryConversation.id)
+
+        let fetchCounts = await messagesStore.fetchConversationCallCounts()
+        XCTAssertEqual(fetchCounts[primaryConversation.id], 1)
+        XCTAssertNil(fetchCounts[secondaryConversation.id])
     }
 }
 
@@ -352,6 +444,57 @@ private actor MonitorMessagesStore: MessagesStoreProtocol {
 
     func currentFetchConversationCallCount() -> Int {
         fetchConversationCallCount
+    }
+}
+
+private actor MultiConversationMonitorMessagesStore: MessagesStoreProtocol {
+    let conversations: [String: ConversationRef]
+    var latestByConversationID: [String: MonitorCursor] = [:]
+    var conversationFetchCounts: [String: Int] = [:]
+
+    init(conversations: [String: ConversationRef]) {
+        self.conversations = conversations
+    }
+
+    func fetchConversations(limit: Int) async throws -> [ConversationRef] {
+        Array(conversations.values.prefix(limit))
+    }
+
+    func fetchConversation(id: String) async throws -> ConversationRef? {
+        conversationFetchCounts[id, default: 0] += 1
+        return conversations[id]
+    }
+
+    func fetchMessages(conversationID: String, limit: Int) async throws -> [ChatMessage] {
+        guard let conversation = conversations[conversationID],
+              let participant = conversation.participants.first else {
+            return []
+        }
+
+        return [
+            ChatMessage(
+                id: "m-\(conversationID)",
+                text: "Need this soon",
+                senderName: participant.displayName,
+                senderHandle: participant.handle,
+                date: .now,
+                direction: .incoming,
+                containsAttachmentPlaceholder: false,
+                isUnsupportedContent: false
+            )
+        ]
+    }
+
+    func latestCursor(conversationID: String) async throws -> MonitorCursor? {
+        latestByConversationID[conversationID]
+    }
+
+    func setLatest(_ cursor: MonitorCursor?, for conversationID: String) {
+        latestByConversationID[conversationID] = cursor
+    }
+
+    func fetchConversationCallCounts() -> [String: Int] {
+        conversationFetchCounts
     }
 }
 

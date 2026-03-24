@@ -11,6 +11,7 @@ final class AppModel {
     var selectedModelName: String = ""
     var conversations: [ConversationRef] = []
     var selectedConversationID: String?
+    var conversationLaunchPreference: ConversationLaunchPreference = .default
     var messages: [ChatMessage] = []
     var currentDraft: ReplyDraft?
     var currentPrompt: PromptPacket?
@@ -31,6 +32,7 @@ final class AppModel {
 
     private var hasStarted = false
     private var hasLoadedPersistentState = false
+    private var hasResolvedConversationSelection = false
     private var monitorTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
 
@@ -71,6 +73,10 @@ final class AppModel {
         conversations.first(where: { $0.id == selectedConversationID })
     }
 
+    var persistConversationSelectionAcrossLaunches: Bool {
+        conversationLaunchPreference.persistSelectionAcrossLaunches
+    }
+
     var showsPermissionGate: Bool {
         hasLoadedPersistentState && !onboardingState.isCompleted && !onboardingState.hasEnteredSetupFlow
     }
@@ -89,6 +95,14 @@ final class AppModel {
 
     var messagesAccessRestricted: Bool {
         !startupIssues.isEmpty
+    }
+
+    var showsConversationChooser: Bool {
+        hasLoadedPersistentState &&
+        hasResolvedConversationSelection &&
+        !messagesAccessRestricted &&
+        !conversations.isEmpty &&
+        selectedConversationID == nil
     }
 
     func refreshModels() async {
@@ -130,6 +144,7 @@ final class AppModel {
     }
 
     func refreshConversations() async {
+        hasResolvedConversationSelection = false
         do {
             conversations = try await container.messagesStore.fetchConversations(limit: 150)
             if conversations.isEmpty {
@@ -139,27 +154,51 @@ final class AppModel {
                     statusMessage = "No conversations available."
                 }
                 selectedConversationID = nil
+                conversationLaunchPreference.conversationID = nil
                 messages = []
                 currentDraft = nil
                 currentPrompt = nil
                 currentPolicyDecision = nil
+                hasResolvedConversationSelection = true
                 return
             }
-            if selectedConversationID == nil {
-                selectedConversationID = conversations.first?.id
+
+            if let currentID = selectedConversationID,
+               await conversationExists(currentID) {
+                hasResolvedConversationSelection = true
+                await loadConversation(id: currentID)
+                return
             }
-            if let selectedConversationID {
-                await loadConversation(id: selectedConversationID)
+
+            if conversationLaunchPreference.persistSelectionAcrossLaunches,
+               let persistedID = conversationLaunchPreference.conversationID,
+               await conversationExists(persistedID) {
+                hasResolvedConversationSelection = true
+                await loadConversation(id: persistedID)
+                return
             }
+
+            if conversationLaunchPreference.persistSelectionAcrossLaunches,
+               conversationLaunchPreference.conversationID != nil {
+                conversationLaunchPreference = .default
+                await persistConversationLaunchPreference()
+                statusMessage = "Saved conversation is no longer available. Pick a conversation to continue."
+            } else if statusMessage.isEmpty || statusMessage == "Loading…" {
+                statusMessage = "Choose a conversation to continue."
+            }
+
+            clearConversationContext()
+            hasResolvedConversationSelection = true
         } catch {
             errorMessage = error.localizedDescription
+            statusMessage = "Unable to load Messages history."
             do {
                 try await container.database.appendActivityLog(
                     ActivityLogEntry(
                         category: .error,
                         severity: .error,
                         conversationID: selectedConversationID,
-                        message: "Draft generation failed.",
+                        message: "Messages history refresh failed.",
                         metadata: ["details": error.localizedDescription]
                     )
                 )
@@ -167,12 +206,23 @@ final class AppModel {
             } catch {
                 errorMessage = error.localizedDescription
             }
+            hasResolvedConversationSelection = true
         }
     }
 
     func loadConversation(id: String) async {
         selectedConversationID = id
-        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
+        conversationLaunchPreference.conversationID = id
+        let conversation: ConversationRef
+        if let existingConversation = conversations.first(where: { $0.id == id }) {
+            conversation = existingConversation
+        } else if let fetchedConversation = try? await container.messagesStore.fetchConversation(id: id) {
+            conversations.removeAll { $0.id == fetchedConversation.id }
+            conversations.insert(fetchedConversation, at: 0)
+            conversation = fetchedConversation
+        } else {
+            return
+        }
 
         do {
             messages = try await container.messagesStore.fetchMessages(conversationID: id, limit: 80)
@@ -182,9 +232,31 @@ final class AppModel {
             summary = try await container.memory.loadSummary(conversationID: conversation.id)
             contactAutonomyConfig = try await container.database.loadAutonomyConfig(conversationID: conversation.id, memoryKey: conversation.memoryKey)
             currentDraft = try await container.memory.loadDraft(conversationID: conversation.id, modelName: selectedModelName)
+            statusMessage = "Loaded context for \(conversation.title)."
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func activateConversation(_ id: String, persistAcrossLaunches: Bool? = nil) async {
+        if let persistAcrossLaunches {
+            conversationLaunchPreference.persistSelectionAcrossLaunches = persistAcrossLaunches
+        }
+        conversationLaunchPreference.conversationID = id
+        await persistConversationLaunchPreference()
+        await loadConversation(id: id)
+        restartMonitoring()
+    }
+
+    func updateConversationLaunchPersistence(_ persistAcrossLaunches: Bool) async {
+        conversationLaunchPreference.persistSelectionAcrossLaunches = persistAcrossLaunches
+        if persistAcrossLaunches {
+            conversationLaunchPreference.conversationID = selectedConversationID
+        }
+        await persistConversationLaunchPreference()
+        statusMessage = persistAcrossLaunches
+            ? "Responder will reopen the selected conversation on launch."
+            : "Responder will ask which conversation to use on launch."
     }
 
     func generateDraft(mode: ReplyOperationMode = .draftSuggestion) async {
@@ -475,6 +547,7 @@ final class AppModel {
             globalSettings = try await container.database.loadGlobalSettings()
             onboardingState = try await container.database.loadOnboardingState()
             providerConfiguration = try await container.database.loadProviderConfiguration()
+            conversationLaunchPreference = try await container.database.loadConversationLaunchPreference()
             if let selected = try await container.database.loadSelectedModel(),
                selected.provider == providerConfiguration.selectedProvider {
                 selectedModelName = selected.model.name
@@ -488,13 +561,19 @@ final class AppModel {
 
     private func restartMonitoring() {
         monitorTask?.cancel()
-        guard globalSettings.autonomyEnabled, !selectedModelName.isEmpty else { return }
+        guard globalSettings.autonomyEnabled,
+              !selectedModelName.isEmpty,
+              let selectedConversationID
+        else { return }
 
         monitorTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
                 do {
-                    _ = try await self.container.autonomy.monitorCycle(modelName: self.selectedModelName)
+                    _ = try await self.container.autonomy.monitorCycle(
+                        modelName: self.selectedModelName,
+                        activeConversationID: selectedConversationID
+                    )
                     await self.refreshActivityLog()
                 } catch {
                     await MainActor.run {
@@ -517,5 +596,31 @@ final class AppModel {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func persistConversationLaunchPreference() async {
+        do {
+            try await container.database.saveConversationLaunchPreference(conversationLaunchPreference)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func conversationExists(_ id: String) async -> Bool {
+        if conversations.contains(where: { $0.id == id }) {
+            return true
+        }
+        return (try? await container.messagesStore.fetchConversation(id: id)) != nil
+    }
+
+    private func clearConversationContext() {
+        selectedConversationID = nil
+        messages = []
+        currentDraft = nil
+        currentPrompt = nil
+        currentPolicyDecision = nil
+        contactMemory = .empty(memoryKey: "preview")
+        summary = .empty(conversationID: "preview")
+        contactAutonomyConfig = .default(conversationID: "preview", memoryKey: "preview")
     }
 }

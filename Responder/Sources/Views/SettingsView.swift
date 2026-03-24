@@ -7,6 +7,41 @@ struct SettingsSceneView: View {
     var body: some View {
         TabView {
             Form {
+                Section("Conversation Context") {
+                    if model.conversations.isEmpty {
+                        Text("No conversations are currently loaded.")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Picker(
+                            "Active Conversation",
+                            selection: Binding(
+                                get: { model.selectedConversationID ?? model.conversations.first?.id ?? "" },
+                                set: { newValue in
+                                    guard !newValue.isEmpty else { return }
+                                    Task { await model.activateConversation(newValue) }
+                                }
+                            )
+                        ) {
+                            ForEach(model.conversations) { conversation in
+                                Text(conversation.title).tag(conversation.id)
+                            }
+                        }
+
+                        Toggle(
+                            "Reopen selected conversation on launch",
+                            isOn: Binding(
+                                get: { model.persistConversationSelectionAcrossLaunches },
+                                set: { newValue in
+                                    Task { await model.updateConversationLaunchPersistence(newValue) }
+                                }
+                            )
+                        )
+
+                        Text("When disabled, Responder asks you to choose a conversation each time it starts.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Section("Provider") {
                     Picker("Active Provider", selection: $model.providerConfiguration.selectedProvider) {
                         ForEach(AIProvider.allCases) { provider in

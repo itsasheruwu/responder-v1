@@ -3,239 +3,265 @@ import Foundation
 import GRDB
 
 actor MessagesStoreReader: MessagesStoreProtocol {
-    private let dbQueue: DatabaseQueue
+    private let sourceDatabaseURL: URL
+    private let snapshotRootURL: URL
+    private let fileManager: FileManager
     private let contactResolver = ContactNameResolver()
 
     init(databaseURL: URL = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Messages/chat.db")) throws {
-        var configuration = Configuration()
-        configuration.readonly = true
-        configuration.label = "MessagesStoreReader"
-        dbQueue = try DatabaseQueue(path: databaseURL.path, configuration: configuration)
+        sourceDatabaseURL = databaseURL
+        fileManager = .default
+        snapshotRootURL = fileManager.temporaryDirectory.appending(path: "ResponderMessagesSnapshots", directoryHint: .isDirectory)
+
+        try fileManager.createDirectory(at: snapshotRootURL, withIntermediateDirectories: true)
+        Self.cleanupSnapshots(at: snapshotRootURL, fileManager: fileManager)
+
+        let snapshot = try Self.makeSnapshotContext(
+            sourceDatabaseURL: sourceDatabaseURL,
+            snapshotRootURL: snapshotRootURL,
+            fileManager: fileManager
+        )
+        _ = try snapshot.dbQueue.read { _ in true }
+        Self.cleanupSnapshot(at: snapshot.directoryURL, fileManager: fileManager)
     }
 
     func fetchConversations(limit: Int) async throws -> [ConversationRef] {
-        let rows: [ConversationRow] = try await dbQueue.read { db in
-            let rows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT c.ROWID AS rowid,
-                       c.guid,
-                       c.display_name,
-                       c.chat_identifier,
-                       c.service_name,
-                       c.style,
-                       m.text AS preview_text,
-                       m.attributedBody AS preview_attributed_body,
-                       m.cache_has_attachments AS preview_has_attachments,
-                       m.item_type AS preview_item_type,
-                       m.associated_message_guid AS preview_associated_guid,
-                       m.date AS last_date,
-                       (
-                         SELECT COUNT(*)
-                         FROM chat_message_join cmj2
-                         JOIN message unread ON unread.ROWID = cmj2.message_id
-                         WHERE cmj2.chat_id = c.ROWID
-                           AND unread.is_from_me = 0
-                           AND unread.is_read = 0
-                           AND unread.is_finished = 1
-                           AND unread.is_system_message = 0
-                       ) AS unread_count
-                FROM chat c
-                LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
-                LEFT JOIN message m ON m.ROWID = cmj.message_id
-                WHERE c.is_archived = 0
-                  AND (
-                    m.ROWID IS NULL OR (
-                        m.is_system_message = 0
-                        AND m.ROWID = (
-                            SELECT latest.ROWID
-                            FROM chat_message_join latest_cmj
-                            JOIN message latest ON latest.ROWID = latest_cmj.message_id
-                            WHERE latest_cmj.chat_id = c.ROWID
-                              AND latest.is_system_message = 0
-                            ORDER BY latest.date DESC, latest.ROWID DESC
-                            LIMIT 1
+        try await withSnapshotQueue { [self] dbQueue in
+            let rows: [ConversationRow] = try await dbQueue.read { db in
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                    SELECT c.ROWID AS rowid,
+                           c.guid,
+                           c.display_name,
+                           c.chat_identifier,
+                           c.service_name,
+                           c.style,
+                           m.text AS preview_text,
+                           m.attributedBody AS preview_attributed_body,
+                           m.cache_has_attachments AS preview_has_attachments,
+                           m.item_type AS preview_item_type,
+                           m.associated_message_guid AS preview_associated_guid,
+                           m.date AS last_date,
+                           (
+                             SELECT COUNT(*)
+                             FROM chat_message_join cmj2
+                             JOIN message unread ON unread.ROWID = cmj2.message_id
+                             WHERE cmj2.chat_id = c.ROWID
+                               AND unread.is_from_me = 0
+                               AND unread.is_read = 0
+                               AND unread.is_finished = 1
+                               AND unread.is_system_message = 0
+                           ) AS unread_count
+                    FROM chat c
+                    LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+                    LEFT JOIN message m ON m.ROWID = cmj.message_id
+                    WHERE c.is_archived = 0
+                      AND (
+                        m.ROWID IS NULL OR (
+                            m.is_system_message = 0
+                            AND m.ROWID = (
+                                SELECT latest.ROWID
+                                FROM chat_message_join latest_cmj
+                                JOIN message latest ON latest.ROWID = latest_cmj.message_id
+                                WHERE latest_cmj.chat_id = c.ROWID
+                                  AND latest.is_system_message = 0
+                                ORDER BY latest.date DESC, latest.ROWID DESC
+                                LIMIT 1
+                            )
                         )
-                    )
-                  )
-                ORDER BY last_date DESC
-                LIMIT ?
-                """,
-                arguments: [limit]
-            )
-
-            return rows.map { row in
-                ConversationRow(
-                    chatRowID: row["rowid"],
-                    guid: row["guid"],
-                    displayName: row["display_name"],
-                    chatIdentifier: row["chat_identifier"],
-                    service: ConversationService(rawService: row["service_name"]),
-                    style: row["style"] ?? 0,
-                    previewText: row["preview_text"],
-                    previewAttributedBody: row["preview_attributed_body"],
-                    previewHasAttachments: (row["preview_has_attachments"] ?? 0) == 1,
-                    previewItemType: row["preview_item_type"] ?? 0,
-                    previewAssociatedGuid: row["preview_associated_guid"],
-                    lastDateRaw: row["last_date"],
-                    unreadCount: row["unread_count"] ?? 0
+                      )
+                    ORDER BY last_date DESC
+                    LIMIT ?
+                    """,
+                    arguments: [limit]
                 )
+
+                return rows.map(Self.makeConversationRow(from:))
             }
+
+            return try await self.hydrateConversations(from: rows, dbQueue: dbQueue)
         }
-
-        var conversations: [ConversationRef] = []
-        conversations.reserveCapacity(rows.count)
-
-        for row in rows {
-            let participants = try await loadParticipants(chatRowID: row.chatRowID, service: row.service)
-            let title = row.displayName?.nonEmpty ?? Self.defaultTitle(
-                chatIdentifier: row.chatIdentifier,
-                participants: participants
-            )
-            let normalized = Self.normalizeMessageText(
-                rawText: row.previewText,
-                attributedBody: row.previewAttributedBody,
-                hasAttachment: row.previewHasAttachments,
-                itemType: row.previewItemType,
-                hasAssociatedContent: row.previewAssociatedGuid != nil
-            )
-
-            conversations.append(
-                ConversationRef(
-                    id: row.guid,
-                    title: title,
-                    service: row.service,
-                    participants: participants,
-                    isGroup: Self.isGroupConversation(participants: participants, style: row.style),
-                    lastMessagePreview: normalized.text,
-                    lastMessageDate: Self.appleDate(rawValue: row.lastDateRaw),
-                    unreadCount: row.unreadCount
-                )
-            )
-        }
-
-        return conversations
     }
 
     func fetchConversation(id: String) async throws -> ConversationRef? {
-        try await fetchConversations(limit: 250).first(where: { $0.id == id })
-    }
-
-    func fetchMessages(conversationID: String, limit: Int) async throws -> [ChatMessage] {
-        let rows: [MessageRow] = try await dbQueue.read { db in
-            let rows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT m.guid,
-                       m.text,
-                       m.attributedBody,
-                       m.date,
-                       m.is_from_me,
-                       m.cache_has_attachments,
-                       m.item_type,
-                       m.associated_message_guid,
-                       m.is_system_message,
-                       h.id AS handle_id,
-                       COALESCE(NULLIF(h.id, ''), 'Me') AS sender_label
-                FROM chat_message_join cmj
-                JOIN chat c ON c.ROWID = cmj.chat_id
-                JOIN message m ON m.ROWID = cmj.message_id
-                LEFT JOIN handle h ON h.ROWID = CASE
-                    WHEN m.handle_id != 0 THEN m.handle_id
-                    ELSE m.other_handle
-                END
-                WHERE c.guid = ?
-                  AND m.is_system_message = 0
-                ORDER BY m.date DESC, m.ROWID DESC
-                LIMIT ?
-                """,
-                arguments: [conversationID, limit]
-            )
-
-            return rows.map { row in
-                MessageRow(
-                    guid: row["guid"],
-                    text: row["text"],
-                    attributedBody: row["attributedBody"],
-                    dateRaw: row["date"],
-                    isFromMe: (row["is_from_me"] ?? 0) == 1,
-                    hasAttachments: (row["cache_has_attachments"] ?? 0) == 1,
-                    itemType: row["item_type"] ?? 0,
-                    associatedGuid: row["associated_message_guid"],
-                    handleID: row["handle_id"],
-                    fallbackSenderLabel: row["sender_label"] ?? "Contact"
+        try await withSnapshotQueue { [self] dbQueue in
+            guard let row = try dbQueue.read({ db in
+                try Row.fetchOne(
+                    db,
+                    sql: """
+                    SELECT c.ROWID AS rowid,
+                           c.guid,
+                           c.display_name,
+                           c.chat_identifier,
+                           c.service_name,
+                           c.style,
+                           m.text AS preview_text,
+                           m.attributedBody AS preview_attributed_body,
+                           m.cache_has_attachments AS preview_has_attachments,
+                           m.item_type AS preview_item_type,
+                           m.associated_message_guid AS preview_associated_guid,
+                           m.date AS last_date,
+                           (
+                             SELECT COUNT(*)
+                             FROM chat_message_join cmj2
+                             JOIN message unread ON unread.ROWID = cmj2.message_id
+                             WHERE cmj2.chat_id = c.ROWID
+                               AND unread.is_from_me = 0
+                               AND unread.is_read = 0
+                               AND unread.is_finished = 1
+                               AND unread.is_system_message = 0
+                           ) AS unread_count
+                    FROM chat c
+                    LEFT JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+                    LEFT JOIN message m ON m.ROWID = cmj.message_id
+                    WHERE c.guid = ?
+                      AND (
+                        m.ROWID IS NULL OR (
+                            m.is_system_message = 0
+                            AND m.ROWID = (
+                                SELECT latest.ROWID
+                                FROM chat_message_join latest_cmj
+                                JOIN message latest ON latest.ROWID = latest_cmj.message_id
+                                WHERE latest_cmj.chat_id = c.ROWID
+                                  AND latest.is_system_message = 0
+                                ORDER BY latest.date DESC, latest.ROWID DESC
+                                LIMIT 1
+                            )
+                        )
+                      )
+                    ORDER BY last_date DESC
+                    LIMIT 1
+                    """,
+                    arguments: [id]
                 )
-            }
-        }
-
-        var messages: [ChatMessage] = []
-        messages.reserveCapacity(rows.count)
-
-        for row in rows.reversed() {
-            guard let date = Self.appleDate(rawValue: row.dateRaw) else { continue }
-            let senderName: String
-            if row.isFromMe {
-                senderName = "Me"
-            } else if let handleID = row.handleID {
-                senderName = await contactResolver.displayName(for: handleID) ?? row.fallbackSenderLabel
-            } else {
-                senderName = row.fallbackSenderLabel
-            }
-
-            let normalized = Self.normalizeMessageText(
-                rawText: row.text,
-                attributedBody: row.attributedBody,
-                hasAttachment: row.hasAttachments,
-                itemType: row.itemType,
-                hasAssociatedContent: row.associatedGuid != nil
-            )
-
-            messages.append(
-                ChatMessage(
-                    id: row.guid,
-                    text: normalized.text,
-                    senderName: senderName,
-                    senderHandle: row.handleID,
-                    date: date,
-                    direction: row.isFromMe ? .outgoing : .incoming,
-                    containsAttachmentPlaceholder: normalized.containsAttachmentPlaceholder,
-                    isUnsupportedContent: normalized.isUnsupportedContent
-                )
-            )
-        }
-
-        return messages
-    }
-
-    func latestCursor(conversationID: String) async throws -> MonitorCursor? {
-        try await dbQueue.read { db in
-            guard let row = try Row.fetchOne(
-                db,
-                sql: """
-                SELECT m.guid, m.date
-                FROM chat c
-                JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
-                JOIN message m ON m.ROWID = cmj.message_id
-                WHERE c.guid = ?
-                  AND m.is_system_message = 0
-                  AND m.is_from_me = 0
-                ORDER BY m.date DESC, m.ROWID DESC
-                LIMIT 1
-                """,
-                arguments: [conversationID]
-            ) else {
+            }) else {
                 return nil
             }
 
-            return MonitorCursor(
-                conversationID: conversationID,
-                lastMessageID: row["guid"],
-                lastMessageDateValue: row["date"] ?? 0
-            )
+            return try await self.hydrateConversation(from: Self.makeConversationRow(from: row), dbQueue: dbQueue)
         }
     }
 
-    private func loadParticipants(chatRowID: Int64, service: ConversationService) async throws -> [Participant] {
+    func fetchMessages(conversationID: String, limit: Int) async throws -> [ChatMessage] {
+        try await withSnapshotQueue { [self] dbQueue in
+            let rows: [MessageRow] = try await dbQueue.read { db in
+                let rows = try Row.fetchAll(
+                    db,
+                    sql: """
+                    SELECT m.guid,
+                           m.text,
+                           m.attributedBody,
+                           m.date,
+                           m.is_from_me,
+                           m.cache_has_attachments,
+                           m.item_type,
+                           m.associated_message_guid,
+                           m.is_system_message,
+                           h.id AS handle_id,
+                           COALESCE(NULLIF(h.id, ''), 'Me') AS sender_label
+                    FROM chat_message_join cmj
+                    JOIN chat c ON c.ROWID = cmj.chat_id
+                    JOIN message m ON m.ROWID = cmj.message_id
+                    LEFT JOIN handle h ON h.ROWID = CASE
+                        WHEN m.handle_id != 0 THEN m.handle_id
+                        ELSE m.other_handle
+                    END
+                    WHERE c.guid = ?
+                      AND m.is_system_message = 0
+                    ORDER BY m.date DESC, m.ROWID DESC
+                    LIMIT ?
+                    """,
+                    arguments: [conversationID, limit]
+                )
+
+                return rows.map { row in
+                    MessageRow(
+                        guid: row["guid"],
+                        text: row["text"],
+                        attributedBody: row["attributedBody"],
+                        dateRaw: row["date"],
+                        isFromMe: (row["is_from_me"] ?? 0) == 1,
+                        hasAttachments: (row["cache_has_attachments"] ?? 0) == 1,
+                        itemType: row["item_type"] ?? 0,
+                        associatedGuid: row["associated_message_guid"],
+                        handleID: row["handle_id"],
+                        fallbackSenderLabel: row["sender_label"] ?? "Contact"
+                    )
+                }
+            }
+
+            var messages: [ChatMessage] = []
+            messages.reserveCapacity(rows.count)
+
+            for row in rows.reversed() {
+                guard let date = Self.appleDate(rawValue: row.dateRaw) else { continue }
+                let senderName: String
+                if row.isFromMe {
+                    senderName = "Me"
+                } else if let handleID = row.handleID {
+                    senderName = await self.contactResolver.displayName(for: handleID) ?? row.fallbackSenderLabel
+                } else {
+                    senderName = row.fallbackSenderLabel
+                }
+
+                let normalized = Self.normalizeMessageText(
+                    rawText: row.text,
+                    attributedBody: row.attributedBody,
+                    hasAttachment: row.hasAttachments,
+                    itemType: row.itemType,
+                    hasAssociatedContent: row.associatedGuid != nil
+                )
+
+                messages.append(
+                    ChatMessage(
+                        id: row.guid,
+                        text: normalized.text,
+                        senderName: senderName,
+                        senderHandle: row.handleID,
+                        date: date,
+                        direction: row.isFromMe ? .outgoing : .incoming,
+                        containsAttachmentPlaceholder: normalized.containsAttachmentPlaceholder,
+                        isUnsupportedContent: normalized.isUnsupportedContent
+                    )
+                )
+            }
+
+            return messages
+        }
+    }
+
+    func latestCursor(conversationID: String) async throws -> MonitorCursor? {
+        try await withSnapshotQueue { dbQueue in
+            try await dbQueue.read { db in
+                guard let row = try Row.fetchOne(
+                    db,
+                    sql: """
+                    SELECT m.guid, m.date
+                    FROM chat c
+                    JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+                    JOIN message m ON m.ROWID = cmj.message_id
+                    WHERE c.guid = ?
+                      AND m.is_system_message = 0
+                      AND m.is_from_me = 0
+                    ORDER BY m.date DESC, m.ROWID DESC
+                    LIMIT 1
+                    """,
+                    arguments: [conversationID]
+                ) else {
+                    return nil
+                }
+
+                return MonitorCursor(
+                    conversationID: conversationID,
+                    lastMessageID: row["guid"],
+                    lastMessageDateValue: row["date"] ?? 0
+                )
+            }
+        }
+    }
+
+    private func loadParticipants(chatRowID: Int64, service: ConversationService, dbQueue: DatabaseQueue) async throws -> [Participant] {
         let handles: [(handle: String, fallbackName: String)] = try await dbQueue.read { db in
             let rows = try Row.fetchAll(
                 db,
@@ -267,6 +293,145 @@ actor MessagesStoreReader: MessagesStoreProtocol {
         }
 
         return participants
+    }
+
+    private func hydrateConversations(from rows: [ConversationRow], dbQueue: DatabaseQueue) async throws -> [ConversationRef] {
+        var conversations: [ConversationRef] = []
+        conversations.reserveCapacity(rows.count)
+
+        for row in rows {
+            let conversation = try await hydrateConversation(from: row, dbQueue: dbQueue)
+            conversations.append(conversation)
+        }
+
+        return conversations
+    }
+
+    private func hydrateConversation(from row: ConversationRow, dbQueue: DatabaseQueue) async throws -> ConversationRef {
+        let participants = try await loadParticipants(chatRowID: row.chatRowID, service: row.service, dbQueue: dbQueue)
+        let title = row.displayName?.nonEmpty ?? Self.defaultTitle(
+            chatIdentifier: row.chatIdentifier,
+            participants: participants
+        )
+        let normalized = Self.normalizeMessageText(
+            rawText: row.previewText,
+            attributedBody: row.previewAttributedBody,
+            hasAttachment: row.previewHasAttachments,
+            itemType: row.previewItemType,
+            hasAssociatedContent: row.previewAssociatedGuid != nil
+        )
+
+        return ConversationRef(
+            id: row.guid,
+            title: title,
+            service: row.service,
+            participants: participants,
+            isGroup: Self.isGroupConversation(participants: participants, style: row.style),
+            lastMessagePreview: normalized.text,
+            lastMessageDate: Self.appleDate(rawValue: row.lastDateRaw),
+            unreadCount: row.unreadCount
+        )
+    }
+
+    private func withSnapshotQueue<T>(_ operation: @escaping (DatabaseQueue) async throws -> T) async throws -> T {
+        let snapshot = try Self.makeSnapshotContext(
+            sourceDatabaseURL: sourceDatabaseURL,
+            snapshotRootURL: snapshotRootURL,
+            fileManager: fileManager
+        )
+        do {
+            let result = try await operation(snapshot.dbQueue)
+            Self.cleanupSnapshot(at: snapshot.directoryURL, fileManager: fileManager)
+            return result
+        } catch {
+            Self.cleanupSnapshot(at: snapshot.directoryURL, fileManager: fileManager)
+            throw error
+        }
+    }
+
+    private static func makeSnapshotContext(
+        sourceDatabaseURL: URL,
+        snapshotRootURL: URL,
+        fileManager: FileManager
+    ) throws -> SnapshotContext {
+        let directoryURL = snapshotRootURL.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+
+        let destinationDatabaseURL = directoryURL.appending(path: sourceDatabaseURL.lastPathComponent)
+
+        do {
+            try fileManager.copyItem(at: sourceDatabaseURL, to: destinationDatabaseURL)
+            try copyCompanionIfPresent(
+                suffix: "-wal",
+                sourceDatabaseURL: sourceDatabaseURL,
+                directoryURL: directoryURL,
+                fileManager: fileManager
+            )
+            try copyCompanionIfPresent(
+                suffix: "-shm",
+                sourceDatabaseURL: sourceDatabaseURL,
+                directoryURL: directoryURL,
+                fileManager: fileManager
+            )
+
+            var configuration = Configuration()
+            configuration.readonly = true
+            configuration.label = "MessagesStoreReaderSnapshot"
+
+            let dbQueue = try DatabaseQueue(path: destinationDatabaseURL.path, configuration: configuration)
+            return SnapshotContext(directoryURL: directoryURL, dbQueue: dbQueue)
+        } catch {
+            cleanupSnapshot(at: directoryURL, fileManager: fileManager)
+            throw error
+        }
+    }
+
+    private static func copyCompanionIfPresent(
+        suffix: String,
+        sourceDatabaseURL: URL,
+        directoryURL: URL,
+        fileManager: FileManager
+    ) throws {
+        let sourceURL = URL(fileURLWithPath: sourceDatabaseURL.path + suffix)
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return }
+
+        let destinationURL = URL(fileURLWithPath: directoryURL.appending(path: sourceDatabaseURL.lastPathComponent).path + suffix)
+        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+    }
+
+    private static func cleanupSnapshots(at snapshotRootURL: URL, fileManager: FileManager) {
+        guard let snapshotURLs = try? fileManager.contentsOfDirectory(
+            at: snapshotRootURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+
+        for snapshotURL in snapshotURLs {
+            cleanupSnapshot(at: snapshotURL, fileManager: fileManager)
+        }
+    }
+
+    private static func cleanupSnapshot(at directoryURL: URL, fileManager: FileManager) {
+        try? fileManager.removeItem(at: directoryURL)
+    }
+
+    private static func makeConversationRow(from row: Row) -> ConversationRow {
+        ConversationRow(
+            chatRowID: row["rowid"],
+            guid: row["guid"],
+            displayName: row["display_name"],
+            chatIdentifier: row["chat_identifier"],
+            service: ConversationService(rawService: row["service_name"]),
+            style: row["style"] ?? 0,
+            previewText: row["preview_text"],
+            previewAttributedBody: row["preview_attributed_body"],
+            previewHasAttachments: (row["preview_has_attachments"] ?? 0) == 1,
+            previewItemType: row["preview_item_type"] ?? 0,
+            previewAssociatedGuid: row["preview_associated_guid"],
+            lastDateRaw: row["last_date"],
+            unreadCount: row["unread_count"] ?? 0
+        )
     }
 
     private static func defaultTitle(chatIdentifier: String?, participants: [Participant]) -> String {
@@ -369,6 +534,11 @@ private struct MessageRow: Sendable {
     let associatedGuid: String?
     let handleID: String?
     let fallbackSenderLabel: String
+}
+
+private struct SnapshotContext {
+    let directoryURL: URL
+    let dbQueue: DatabaseQueue
 }
 
 actor ContactNameResolver {

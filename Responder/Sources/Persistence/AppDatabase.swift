@@ -176,6 +176,25 @@ actor AppDatabase {
         )
     }
 
+    func loadConversationLaunchPreference() throws -> ConversationLaunchPreference {
+        try dbQueue.read { db in
+            if let row = try Row.fetchOne(db, sql: "SELECT value_json FROM app_settings WHERE key = 'conversation_launch_preference'") {
+                return try decode(ConversationLaunchPreference.self, from: row["value_json"])
+            }
+            return .default
+        }
+    }
+
+    func saveConversationLaunchPreference(_ preference: ConversationLaunchPreference) throws {
+        try upsertJSON(
+            table: "app_settings",
+            keyColumn: "key",
+            keyValue: "conversation_launch_preference",
+            jsonColumn: "value_json",
+            value: preference
+        )
+    }
+
     func loadSelectedModel() throws -> SelectedModelState? {
         try dbQueue.read { db in
             guard let row = try Row.fetchOne(db, sql: "SELECT provider, model_name, context_limit FROM selected_model WHERE id = 1") else {
