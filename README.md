@@ -77,9 +77,9 @@ Build the local release artifacts:
 
 That script generates:
 
-- `release/1.0.2/Responder.app.zip`
-- `release/1.0.2/Responder-1.0.2.pkg`
-- `release/1.0.2/install.sh`
+- `release/1.0.1/Responder.app.zip`
+- `release/1.0.1/Responder-1.0.1.pkg`
+- `release/1.0.1/install.sh`
 
 ## Local Runtime Requirements
 
