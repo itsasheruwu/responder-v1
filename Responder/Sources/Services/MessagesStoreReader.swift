@@ -218,6 +218,7 @@ actor MessagesStoreReader: MessagesStoreProtocol {
                 JOIN message m ON m.ROWID = cmj.message_id
                 WHERE c.guid = ?
                   AND m.is_system_message = 0
+                  AND m.is_from_me = 0
                 ORDER BY m.date DESC, m.ROWID DESC
                 LIMIT 1
                 """,

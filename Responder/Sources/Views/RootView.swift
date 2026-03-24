@@ -216,13 +216,7 @@ struct ReplyInspectorView: View {
                 } else {
                     GroupBox("Draft") {
                         VStack(alignment: .leading, spacing: 8) {
-                            TextEditor(text: Binding(
-                                get: { draftText },
-                                set: { newValue in
-                                    draftText = newValue
-                                    Task { await model.saveCurrentDraftText(newValue) }
-                                }
-                            ))
+                            TextEditor(text: $draftText)
                             .frame(minHeight: 180)
 
                             HStack {
@@ -303,6 +297,15 @@ struct ReplyInspectorView: View {
         }
         .onChange(of: model.currentDraft?.id, initial: true) {
             draftText = model.currentDraft?.text ?? ""
+        }
+        .onChange(of: model.currentDraft?.text) {
+            let latest = model.currentDraft?.text ?? ""
+            if latest != draftText {
+                draftText = latest
+            }
+        }
+        .onChange(of: draftText) { _, newValue in
+            model.scheduleDraftSave(newValue)
         }
     }
 }

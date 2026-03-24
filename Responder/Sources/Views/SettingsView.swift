@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsSceneView: View {
     @Bindable var model: AppModel
+    @State private var draftGlobalSettings: GlobalAutonomySettings = .default
 
     var body: some View {
         TabView {
@@ -77,13 +78,14 @@ struct SettingsSceneView: View {
 
             Form {
                 Section("Global Autonomy") {
-                    Toggle("Enable monitoring engine", isOn: $model.globalSettings.autonomyEnabled)
-                    Toggle("Emergency stop", isOn: $model.globalSettings.emergencyStopEnabled)
-                    Stepper("Default quiet hours start: \(model.globalSettings.defaultQuietHoursStartHour):00", value: $model.globalSettings.defaultQuietHoursStartHour, in: 0...23)
-                    Stepper("Default quiet hours end: \(model.globalSettings.defaultQuietHoursEndHour):00", value: $model.globalSettings.defaultQuietHoursEndHour, in: 0...23)
-                    Stepper("Monitor poll interval: \(model.globalSettings.monitorPollIntervalSeconds)s", value: $model.globalSettings.monitorPollIntervalSeconds, in: 5...120, step: 5)
+                    Toggle("Enable monitoring engine", isOn: $draftGlobalSettings.autonomyEnabled)
+                    Toggle("Emergency stop", isOn: $draftGlobalSettings.emergencyStopEnabled)
+                    Stepper("Default quiet hours start: \(draftGlobalSettings.defaultQuietHoursStartHour):00", value: $draftGlobalSettings.defaultQuietHoursStartHour, in: 0...23)
+                    Stepper("Default quiet hours end: \(draftGlobalSettings.defaultQuietHoursEndHour):00", value: $draftGlobalSettings.defaultQuietHoursEndHour, in: 0...23)
+                    Stepper("Monitor poll interval: \(draftGlobalSettings.monitorPollIntervalSeconds)s", value: $draftGlobalSettings.monitorPollIntervalSeconds, in: 5...120, step: 5)
                     Button("Save Global Settings") {
-                        Task { await model.saveGlobalSettings() }
+                        let updatedSettings = draftGlobalSettings
+                        Task { await model.updateGlobalSettings(updatedSettings) }
                     }
                 }
             }
@@ -105,5 +107,11 @@ struct SettingsSceneView: View {
             .padding()
         }
         .frame(width: 720, height: 480)
+        .task {
+            draftGlobalSettings = model.globalSettings
+        }
+        .onChange(of: model.globalSettings) { _, newValue in
+            draftGlobalSettings = newValue
+        }
     }
 }

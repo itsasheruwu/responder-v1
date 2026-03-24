@@ -175,7 +175,6 @@ actor AutonomyEngine: AutonomyCoordinating {
                 continue
             }
 
-            try await database.saveMonitorCursor(latest)
             let mode: ReplyOperationMode = config.autoSendEnabled ? .autonomousSend : .simulation
             let result = try await generateReply(conversationID: config.conversationID, modelName: modelName, mode: mode)
 
@@ -191,6 +190,8 @@ actor AutonomyEngine: AutonomyCoordinating {
             if mode == .autonomousSend && result.policyDecision.action == .allow {
                 try await sendDraft(result.draft, conversationID: config.conversationID, mode: .autonomousSend)
             }
+
+            try await database.saveMonitorCursor(latest)
         }
 
         return entries

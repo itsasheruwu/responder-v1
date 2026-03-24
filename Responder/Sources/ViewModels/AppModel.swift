@@ -32,6 +32,7 @@ final class AppModel {
     private var hasStarted = false
     private var hasLoadedPersistentState = false
     private var monitorTask: Task<Void, Never>?
+    private var draftSaveTask: Task<Void, Never>?
 
     init(container: AppContainer) {
         self.container = container
@@ -94,6 +95,8 @@ final class AppModel {
         do {
             var models = try await container.llm.listModels()
             if models.isEmpty {
+                availableModels = []
+                selectedModelName = ""
                 statusMessage = selectedProvider == .ollama ? "No local Ollama models found." : "No OpenRouter models available."
             } else {
                 for index in models.indices {
@@ -108,7 +111,7 @@ final class AppModel {
                     }
                 }
                 availableModels = models
-                if selectedModelName.isEmpty {
+                if !models.contains(where: { $0.name == selectedModelName }) {
                     selectedModelName = models.first?.name ?? ""
                 }
                 if let selected = models.first(where: { $0.name == selectedModelName }) {
@@ -117,6 +120,8 @@ final class AppModel {
                 statusMessage = "Loaded \(models.count) \(selectedProvider.displayName) model(s)."
             }
         } catch {
+            availableModels = []
+            selectedModelName = ""
             errorMessage = error.localizedDescription
             statusMessage = selectedProvider == .ollama
                 ? "Ollama unavailable. Generation is disabled until it is reachable."
@@ -306,6 +311,7 @@ final class AppModel {
     }
 
     func saveCurrentDraftText(_ text: String) async {
+        draftSaveTask?.cancel()
         guard var draft = currentDraft else { return }
         draft.text = text
         currentDraft = draft
@@ -313,6 +319,17 @@ final class AppModel {
             try await container.memory.saveDraft(draft)
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    func scheduleDraftSave(_ text: String) {
+        draftSaveTask?.cancel()
+        guard currentDraft != nil else { return }
+
+        draftSaveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.saveCurrentDraftText(text)
         }
     }
 
@@ -329,6 +346,11 @@ final class AppModel {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func updateGlobalSettings(_ settings: GlobalAutonomySettings) async {
+        globalSettings = settings
+        await saveGlobalSettings()
     }
 
     func clearError() {
