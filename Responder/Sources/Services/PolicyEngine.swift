@@ -78,7 +78,7 @@ actor PolicyEngine: PolicyEvaluating {
                 action = max(action, .draftOnly)
             }
 
-            let recentInterval = Date().addingTimeInterval(TimeInterval(-config.minimumMinutesBetweenSends * 60))
+            let recentInterval = Date().addingTimeInterval(TimeInterval(-config.minimumSecondsBetweenSends))
             if try await database.countAutoSends(conversationID: conversation.id, since: recentInterval) > 0 {
                 riskFlags.insert("rate_limit_interval")
                 reasons.append("Minimum interval between auto-sends has not elapsed.")
@@ -93,7 +93,8 @@ actor PolicyEngine: PolicyEvaluating {
             }
         }
 
-        if action != .block,
+        if mode != .draftSuggestion,
+           action != .block,
            let modelDecision = try? await ollama.classifyRisk(modelName: draft.modelName, conversation: conversation, messages: messages, draft: draft) {
             riskFlags.formUnion(modelDecision.riskFlags)
             reasons.append(contentsOf: modelDecision.reasons)

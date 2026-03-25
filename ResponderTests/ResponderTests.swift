@@ -170,7 +170,8 @@ final class ResponderTests: XCTestCase {
                 database: database,
                 ollama: previewLLM
             ),
-            startupIssues: []
+            startupIssues: [],
+            messagesDirectoryAccess: nil
         )
         let model = await MainActor.run { AppModel(container: container) }
         await MainActor.run {
@@ -199,6 +200,77 @@ final class ResponderTests: XCTestCase {
         XCTAssertEqual(loaded, preference)
     }
 
+    func testProviderConfigurationPersists() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let configuration = ProviderConfiguration(
+            selectedProvider: .openRouter,
+            openRouterAPIKey: "test-key",
+            openRouterBaseURL: "https://example.com/api"
+        )
+
+        try await database.saveProviderConfiguration(configuration)
+        let loaded = try await database.loadProviderConfiguration()
+
+        XCTAssertEqual(loaded, configuration)
+    }
+
+    func testAutonomyContactConfigDecodesLegacyMinuteIntervalAsSeconds() throws {
+        let data = Data("""
+        {
+          "conversationID": "c1",
+          "memoryKey": "alex@example.com",
+          "monitoringEnabled": true,
+          "simulationMode": true,
+          "autoSendEnabled": false,
+          "confidenceThreshold": 0.88,
+          "quietHoursStartHour": 22,
+          "quietHoursEndHour": 7,
+          "minimumMinutesBetweenSends": 2,
+          "dailySendLimit": 5,
+          "requiresCompletedSimulation": true
+        }
+        """.utf8)
+
+        let decoded = try JSONDecoder().decode(AutonomyContactConfig.self, from: data)
+
+        XCTAssertEqual(decoded.minimumSecondsBetweenSends, 120)
+    }
+
+    func testGlobalAutonomySettingsDecodesLegacyMinuteIntervalAsSeconds() throws {
+        let data = Data("""
+        {
+          "autonomyEnabled": true,
+          "emergencyStopEnabled": false,
+          "defaultQuietHoursStartHour": 22,
+          "defaultQuietHoursEndHour": 7,
+          "defaultConfidenceThreshold": 0.88,
+          "defaultMinimumMinutesBetweenSends": 3,
+          "defaultDailySendLimit": 5,
+          "monitorPollIntervalSeconds": 15
+        }
+        """.utf8)
+
+        let decoded = try JSONDecoder().decode(GlobalAutonomySettings.self, from: data)
+
+        XCTAssertEqual(decoded.defaultMinimumSecondsBetweenSends, 180)
+    }
+
+    func testMessagesDirectoryAccessStoreRoundTripsSavedAccess() throws {
+        let directoryURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        defer {
+            MessagesDirectoryAccessStore.clear()
+            try? FileManager.default.removeItem(at: directoryURL)
+        }
+
+        let saved = try MessagesDirectoryAccessStore.save(directoryURL: directoryURL)
+        let loaded = MessagesDirectoryAccessStore.load()
+
+        XCTAssertEqual(loaded, saved)
+        XCTAssertEqual(loaded?.directoryPath, directoryURL.path)
+        XCTAssertFalse(loaded?.bookmarkData.isEmpty ?? true)
+    }
+
     func testScheduledDraftSavePersistsLatestTextOnly() async throws {
         let database = try AppDatabase(inMemory: true)
         let previewLLM = PreviewOllamaClient()
@@ -221,7 +293,8 @@ final class ResponderTests: XCTestCase {
                 database: database,
                 ollama: previewLLM
             ),
-            startupIssues: []
+            startupIssues: [],
+            messagesDirectoryAccess: nil
         )
         let model = await MainActor.run { AppModel(container: container) }
         let draft = ReplyDraft.empty(conversationID: "c1", modelName: "model")
@@ -238,6 +311,366 @@ final class ResponderTests: XCTestCase {
         let currentDraftText = await MainActor.run { model.currentDraft?.text }
         XCTAssertEqual(currentDraftText, "second")
         XCTAssertEqual(savedDraft.text, "second")
+    }
+
+    func testMemoryEngineInfersAndPersistsRelationshipSummary() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let memory = MemoryEngine(database: database)
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+
+        let messages = [
+            ChatMessage(id: "i1", text: "Love you, talk after our date night?", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false),
+            ChatMessage(id: "o1", text: "Sounds good babe", senderName: "Me", senderHandle: nil, date: .now.addingTimeInterval(1), direction: .outgoing, containsAttachmentPlaceholder: false, isUnsupportedContent: false),
+            ChatMessage(id: "i2", text: "Miss you already", senderName: "Alex", senderHandle: "alex@example.com", date: .now.addingTimeInterval(2), direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+        ]
+
+        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+        let updated = try await memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
+
+        XCTAssertEqual(updated.relationshipSummary, "One-on-one conversation with Alex. Likely a romantic relationship.")
+    }
+
+    func testMemoryEngineUsesOpenRouterRelationshipSummaryWhenConfigured() async throws {
+        let database = try AppDatabase(inMemory: true)
+        try await database.saveProviderConfiguration(
+            ProviderConfiguration(
+                selectedProvider: .ollama,
+                openRouterAPIKey: "test-key",
+                openRouterBaseURL: "https://example.com/api/v1"
+            )
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockOpenRouterURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MockOpenRouterURLProtocol.reset(
+            responseStatusCode: 200,
+            responseBody: """
+        {
+          "choices": [{
+            "message": {
+              "content": "{\\"userProfileSummary\\":\\"You write concise, direct replies and usually stay focused on logistics.\\",\\"userStyleTraits\\":[\\"brief\\",\\"direct\\"],\\"userBannedPhrases\\":[],\\"userBackgroundFacts\\":[\\"You often coordinate deliverables and timelines.\\"],\\"userReplyHabits\\":[\\"usually answers quickly with a practical next step\\"],\\"contactRelationshipSummary\\":\\"Alex seems like a coworker you coordinate with directly, and the conversation is practical and task-focused.\\",\\"contactPreferences\\":[\\"prefers direct coordination\\"],\\"contactRecurringTopics\\":[\\"project deadlines\\",\\"client decks\\"],\\"contactBoundaries\\":[],\\"contactNotes\\":[\\"often reaches out about work tasks\\"]}"
+            }
+          }]
+        }
+        """
+        )
+
+        let memory = MemoryEngine(
+            database: database,
+            openRouterClient: OpenRouterClient(session: session)
+        )
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+
+        let messages = [
+            ChatMessage(id: "i1", text: "Project deadline moved to Friday", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false),
+            ChatMessage(id: "i2", text: "Can you update the client deck?", senderName: "Alex", senderHandle: "alex@example.com", date: .now.addingTimeInterval(1), direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+        ]
+
+        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+        let updatedUser = try await memory.loadUserProfileMemory()
+        let updated = try await memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
+
+        XCTAssertEqual(updatedUser.profileSummary, "You write concise, direct replies and usually stay focused on logistics.")
+        XCTAssertTrue(updatedUser.styleTraits.contains("brief"))
+        XCTAssertTrue(updatedUser.backgroundFacts.contains("You often coordinate deliverables and timelines."))
+        XCTAssertEqual(updated.relationshipSummary, "Alex seems like a coworker you coordinate with directly, and the conversation is practical and task-focused.")
+        XCTAssertTrue(updated.preferences.contains("prefers direct coordination"))
+        XCTAssertTrue(updated.recurringTopics.contains("project deadlines"))
+        XCTAssertTrue(updated.notes.contains("often reaches out about work tasks"))
+    }
+
+    func testManualMemoryRemainsSeparateFromDerivedMemory() async throws {
+        let database = try AppDatabase(inMemory: true)
+        try await database.saveUserProfileMemory(
+            UserProfileMemory(
+                profileSummary: "Manual voice summary",
+                styleTraits: ["warm"],
+                bannedPhrases: [],
+                backgroundFacts: [],
+                replyHabits: []
+            )
+        )
+        try await database.saveContactMemory(
+            ContactMemory(
+                memoryKey: "alex@example.com",
+                relationshipSummary: "Manual relationship note",
+                preferences: ["prefers thoughtful replies"],
+                recurringTopics: [],
+                boundaries: [],
+                notes: []
+            ),
+            conversationID: "c1"
+        )
+        try await database.saveProviderConfiguration(
+            ProviderConfiguration(
+                selectedProvider: .ollama,
+                openRouterAPIKey: "test-key",
+                openRouterBaseURL: "https://example.com/api/v1"
+            )
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockOpenRouterURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MockOpenRouterURLProtocol.reset(
+            responseStatusCode: 200,
+            responseBody: """
+            {
+              "choices": [{
+                "message": {
+                  "content": "{\\"userProfileSummary\\":\\"Derived voice summary\\",\\"userStyleTraits\\":[\\"brief\\"],\\"userBannedPhrases\\":[],\\"userBackgroundFacts\\":[\\"Derived fact\\"],\\"userReplyHabits\\":[\\"Derived habit\\"],\\"contactRelationshipSummary\\":\\"Derived relationship summary\\",\\"contactPreferences\\":[\\"Derived preference\\"],\\"contactRecurringTopics\\":[\\"Derived topic\\"],\\"contactBoundaries\\":[\\"Derived boundary\\"],\\"contactNotes\\":[\\"Derived note\\"]}"
+                }
+              }]
+            }
+            """
+        )
+
+        let memory = MemoryEngine(
+            database: database,
+            openRouterClient: OpenRouterClient(session: session)
+        )
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+        let messages = [
+            ChatMessage(id: "i1", text: "Can you send the notes?", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+        ]
+
+        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+
+        let storedManualUser = try await database.loadUserProfileMemory()
+        let storedManualContact = try await database.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
+        let storedDerivedUser = try await database.loadDerivedUserProfileMemory()
+        let storedDerivedContact = try await database.loadDerivedContactMemory(memoryKey: conversation.memoryKey)
+        let mergedUser = try await memory.loadUserProfileMemory()
+        let mergedContact = try await memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
+
+        XCTAssertEqual(storedManualUser.profileSummary, "Manual voice summary")
+        XCTAssertEqual(storedManualContact.relationshipSummary, "Manual relationship note")
+        XCTAssertEqual(storedDerivedUser.profileSummary, "Derived voice summary")
+        XCTAssertEqual(storedDerivedContact.relationshipSummary, "Derived relationship summary")
+        XCTAssertEqual(mergedUser.profileSummary, "Manual voice summary")
+        XCTAssertEqual(mergedContact.relationshipSummary, "Manual relationship note")
+        XCTAssertTrue(mergedUser.styleTraits.contains("warm"))
+        XCTAssertTrue(mergedUser.styleTraits.contains("brief"))
+        XCTAssertTrue(mergedContact.preferences.contains("prefers thoughtful replies"))
+        XCTAssertTrue(mergedContact.preferences.contains("Derived preference"))
+    }
+
+    func testMemoryFingerprintSkipsRepeatedOpenRouterUpdatesForUnchangedTranscript() async throws {
+        let database = try AppDatabase(inMemory: true)
+        try await database.saveProviderConfiguration(
+            ProviderConfiguration(
+                selectedProvider: .ollama,
+                openRouterAPIKey: "test-key",
+                openRouterBaseURL: "https://example.com/api/v1"
+            )
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockOpenRouterURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MockOpenRouterURLProtocol.reset(
+            responseStatusCode: 200,
+            responseBody: """
+            {
+              "choices": [{
+                "message": {
+                  "content": "{\\"userProfileSummary\\":\\"Derived once\\",\\"userStyleTraits\\":[],\\"userBannedPhrases\\":[],\\"userBackgroundFacts\\":[],\\"userReplyHabits\\":[],\\"contactRelationshipSummary\\":\\"Derived once\\",\\"contactPreferences\\":[],\\"contactRecurringTopics\\":[],\\"contactBoundaries\\":[],\\"contactNotes\\":[]}"
+                }
+              }]
+            }
+            """
+        )
+
+        let memory = MemoryEngine(
+            database: database,
+            openRouterClient: OpenRouterClient(session: session)
+        )
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+        let messages = [
+            ChatMessage(id: "i1", text: "Can you send the notes?", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+        ]
+
+        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+
+        XCTAssertEqual(MockOpenRouterURLProtocol.requestCount, 1)
+    }
+
+    func testMemoryEnginePersistsOpenRouterSyncMetadata() async throws {
+        let database = try AppDatabase(inMemory: true)
+        try await database.saveProviderConfiguration(
+            ProviderConfiguration(
+                selectedProvider: .ollama,
+                openRouterAPIKey: "test-key",
+                openRouterBaseURL: "https://example.com/api/v1"
+            )
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockOpenRouterURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MockOpenRouterURLProtocol.reset(
+            responseStatusCode: 200,
+            responseBody: """
+            {
+              "choices": [{
+                "message": {
+                  "content": "{\\"userProfileSummary\\":\\"Derived once\\",\\"userStyleTraits\\":[],\\"userBannedPhrases\\":[],\\"userBackgroundFacts\\":[],\\"userReplyHabits\\":[],\\"contactRelationshipSummary\\":\\"Derived once\\",\\"contactPreferences\\":[],\\"contactRecurringTopics\\":[],\\"contactBoundaries\\":[],\\"contactNotes\\":[]}"
+                }
+              }]
+            }
+            """
+        )
+
+        let memory = MemoryEngine(
+            database: database,
+            openRouterClient: OpenRouterClient(session: session)
+        )
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+
+        try await memory.synchronizeMemories(
+            conversation: conversation,
+            messages: [
+                ChatMessage(id: "i1", text: "Can you send the notes?", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+            ]
+        )
+
+        let userMetadata = try await database.loadDerivedUserProfileMemoryMetadata()
+        let contactMetadata = try await database.loadDerivedContactMemoryMetadata(memoryKey: conversation.memoryKey)
+
+        XCTAssertEqual(userMetadata?.source, .openRouter)
+        XCTAssertEqual(contactMetadata?.source, .openRouter)
+        XCTAssertNotNil(userMetadata?.syncedAt)
+        XCTAssertNotNil(contactMetadata?.syncedAt)
+    }
+
+    func testMemoryEnginePersistsHeuristicSyncMetadataWithoutOpenRouter() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let memory = MemoryEngine(database: database)
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+
+        try await memory.synchronizeMemories(
+            conversation: conversation,
+            messages: [
+                ChatMessage(id: "i1", text: "Project deadline moved to Friday", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+            ]
+        )
+
+        let userMetadata = try await database.loadDerivedUserProfileMemoryMetadata()
+        let contactMetadata = try await database.loadDerivedContactMemoryMetadata(memoryKey: conversation.memoryKey)
+
+        XCTAssertEqual(userMetadata?.source, .heuristic)
+        XCTAssertEqual(contactMetadata?.source, .heuristic)
+    }
+
+    func testLoadConversationRefreshesDerivedRelationshipSummaryAutomatically() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let previewLLM = PreviewOllamaClient()
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+        let messages = [
+            ChatMessage(id: "i1", text: "Project deadline moved to Friday", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false),
+            ChatMessage(id: "i2", text: "Can you update the client deck?", senderName: "Alex", senderHandle: "alex@example.com", date: .now.addingTimeInterval(1), direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+        ]
+        let store = ScriptedMessagesStore(conversations: [conversation], messagesByConversationID: [conversation.id: messages])
+        let memory = MemoryEngine(database: database)
+        let container = AppContainer(
+            database: database,
+            llm: StaticModelsLLMClient(models: [OllamaModelInfo(name: "model", digest: nil, sizeBytes: nil, modifiedAt: nil, contextLimit: 4096)]),
+            messagesStore: store,
+            sender: PreviewMessagesSender(),
+            contextManager: ContextManager(),
+            summarizer: Summarizer(ollama: previewLLM, database: database),
+            memory: memory,
+            policy: PolicyEngine(ollama: previewLLM, database: database),
+            autonomy: AutonomyEngine(
+                store: store,
+                sender: PreviewMessagesSender(),
+                contextManager: ContextManager(),
+                summarizer: Summarizer(ollama: previewLLM, database: database),
+                memory: memory,
+                policy: PolicyEngine(ollama: previewLLM, database: database),
+                database: database,
+                ollama: previewLLM
+            ),
+            startupIssues: [],
+            messagesDirectoryAccess: nil
+        )
+        let model = await MainActor.run { AppModel(container: container) }
+
+        await MainActor.run {
+            model.conversations = [conversation]
+            model.selectedModelName = "model"
+        }
+
+        await model.loadConversation(id: conversation.id)
+
+        await MainActor.run {
+            XCTAssertEqual(model.contactMemory.relationshipSummary, "One-on-one conversation with Alex. Likely a work relationship.")
+        }
     }
 
     func testMonitorCycleIgnoresOutgoingCursorChangesAndRetriesAfterFailure() async throws {
@@ -274,7 +707,7 @@ final class ResponderTests: XCTestCase {
             defaultQuietHoursStartHour: 22,
             defaultQuietHoursEndHour: 7,
             defaultConfidenceThreshold: 0.88,
-            defaultMinimumMinutesBetweenSends: 30,
+            defaultMinimumSecondsBetweenSends: 30,
             defaultDailySendLimit: 5,
             monitorPollIntervalSeconds: 15
         ))
@@ -354,7 +787,7 @@ final class ResponderTests: XCTestCase {
             defaultQuietHoursStartHour: 22,
             defaultQuietHoursEndHour: 7,
             defaultConfidenceThreshold: 0.88,
-            defaultMinimumMinutesBetweenSends: 30,
+            defaultMinimumSecondsBetweenSends: 30,
             defaultDailySendLimit: 5,
             monitorPollIntervalSeconds: 15
         ))
@@ -496,6 +929,67 @@ private actor MultiConversationMonitorMessagesStore: MessagesStoreProtocol {
     func fetchConversationCallCounts() -> [String: Int] {
         conversationFetchCounts
     }
+}
+
+private actor ScriptedMessagesStore: MessagesStoreProtocol {
+    let conversations: [ConversationRef]
+    let messagesByConversationID: [String: [ChatMessage]]
+
+    init(conversations: [ConversationRef], messagesByConversationID: [String: [ChatMessage]]) {
+        self.conversations = conversations
+        self.messagesByConversationID = messagesByConversationID
+    }
+
+    func fetchConversations(limit: Int) async throws -> [ConversationRef] {
+        Array(conversations.prefix(limit))
+    }
+
+    func fetchConversation(id: String) async throws -> ConversationRef? {
+        conversations.first(where: { $0.id == id })
+    }
+
+    func fetchMessages(conversationID: String, limit: Int) async throws -> [ChatMessage] {
+        Array((messagesByConversationID[conversationID] ?? []).prefix(limit))
+    }
+
+    func latestCursor(conversationID: String) async throws -> MonitorCursor? {
+        nil
+    }
+}
+
+private final class MockOpenRouterURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var responseStatusCode = 200
+    nonisolated(unsafe) static var responseBody = ""
+    nonisolated(unsafe) static var requestCount = 0
+
+    static func reset(responseStatusCode: Int, responseBody: String) {
+        Self.responseStatusCode = responseStatusCode
+        Self.responseBody = responseBody
+        Self.requestCount = 0
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.requestCount += 1
+        let response = HTTPURLResponse(
+            url: request.url ?? URL(string: "https://example.com")!,
+            statusCode: Self.responseStatusCode,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "application/json"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(Self.responseBody.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
 
 private func XCTAssertThrowsErrorAsync(

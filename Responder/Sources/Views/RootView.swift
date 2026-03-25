@@ -35,22 +35,7 @@ struct RootView: View {
         .navigationTitle("Responder")
         .toolbar {
             ToolbarItemGroup {
-                Picker("Model", selection: $model.selectedModelName) {
-                    ForEach(model.availableModels) { item in
-                        Text(item.name).tag(item.name)
-                    }
-                }
-                .frame(width: 220)
-                .onChange(of: model.selectedModelName) {
-                    Task { await model.persistSelectedModel() }
-                }
-
-                Button("Refresh") {
-                    Task {
-                        await model.refreshModels()
-                        await model.refreshConversations()
-                    }
-                }
+                ModelToolbarSelector(model: model)
 
                 Button("Memory Inspector") {
                     openWindow(id: "memory-inspector")
@@ -75,17 +60,40 @@ struct RootView: View {
                     Text("Emergency Stop")
                 }
                 .toggleStyle(.switch)
+
+                if model.isUpdatingMemory {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Updating Memory")
+                            .font(.caption)
+                    }
+                }
             }
         }
         .overlay(alignment: .bottom) {
-            if !model.statusMessage.isEmpty {
-                Text(model.statusMessage)
+            VStack(spacing: 8) {
+                if model.isUpdatingMemory, let memoryUpdateStatus = model.memoryUpdateStatus {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(memoryUpdateStatus)
+                    }
                     .font(.footnote)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(.regularMaterial, in: Capsule())
-                    .padding()
+                }
+
+                if !model.statusMessage.isEmpty {
+                    Text(model.statusMessage)
+                        .font(.footnote)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule())
+                }
             }
+            .padding()
         }
         .task {
             await model.startIfNeeded()
@@ -104,6 +112,76 @@ struct RootView: View {
 
     private var overlayActive: Bool {
         model.showsPermissionGate || model.showsOnboarding || model.showsConversationChooser
+    }
+}
+
+private struct ModelToolbarSelector: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(model.selectedProvider.displayName)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Menu {
+                    if model.availableModels.isEmpty {
+                        Text("No models available")
+                    } else {
+                        ForEach(model.availableModels) { item in
+                            Button {
+                                model.selectedModelName = item.name
+                                Task { await model.persistSelectedModel() }
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.name)
+                                        Text("\(item.contextLimit) context")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if item.name == model.selectedModelName {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(model.selectedModelName.isEmpty ? "Select Model" : model.selectedModelName)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                            Text(model.selectedModel.map { "\($0.contextLimit) context" } ?? "\(model.availableModels.count) available")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Image(systemName: "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .frame(width: 260, alignment: .leading)
+                    .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                .menuStyle(.borderlessButton)
+            }
+
+            Button {
+                Task {
+                    await model.refreshModels()
+                    await model.refreshConversations()
+                }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .help("Refresh models and conversations")
+            .disabled(model.isGenerating || model.isLoading)
+        }
     }
 }
 
@@ -437,7 +515,7 @@ struct AutonomySettingsForm: View {
             Slider(value: $model.contactAutonomyConfig.confidenceThreshold, in: 0.5...0.99, step: 0.01)
             Stepper("Quiet hours start: \(model.contactAutonomyConfig.quietHoursStartHour):00", value: $model.contactAutonomyConfig.quietHoursStartHour, in: 0...23)
             Stepper("Quiet hours end: \(model.contactAutonomyConfig.quietHoursEndHour):00", value: $model.contactAutonomyConfig.quietHoursEndHour, in: 0...23)
-            Stepper("Min minutes between auto-sends: \(model.contactAutonomyConfig.minimumMinutesBetweenSends)", value: $model.contactAutonomyConfig.minimumMinutesBetweenSends, in: 5...180, step: 5)
+            Stepper("Min seconds between auto-sends: \(model.contactAutonomyConfig.minimumSecondsBetweenSends)", value: $model.contactAutonomyConfig.minimumSecondsBetweenSends, in: 5...300, step: 5)
             Stepper("Daily auto-send limit: \(model.contactAutonomyConfig.dailySendLimit)", value: $model.contactAutonomyConfig.dailySendLimit, in: 1...20)
             Toggle("Require simulation pass first", isOn: $model.contactAutonomyConfig.requiresCompletedSimulation)
             Button("Save Contact Autonomy Settings") {

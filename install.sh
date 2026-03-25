@@ -52,3 +52,6 @@ cp -R "$app_path" "$target_path"
 xattr -dr com.apple.quarantine "$target_path" 2>/dev/null || true
 
 echo "${APP_NAME} installed at ${target_path}"
+if [[ "$TAG" == "latest" ]]; then
+  echo "This build came from the latest GitHub Release (${archive_name}), not necessarily the latest commit on the default branch. Publish a new release (or pass an explicit tag) to update."
+fi

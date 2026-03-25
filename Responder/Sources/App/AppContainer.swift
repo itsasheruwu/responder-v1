@@ -11,19 +11,21 @@ struct AppContainer {
     let policy: any PolicyEvaluating
     let autonomy: any AutonomyCoordinating
     let startupIssues: [String]
+    let messagesDirectoryAccess: MessagesDirectoryAccess?
 
-    static func live() throws -> AppContainer {
-        let database = try AppDatabase()
+    static func live(database existingDatabase: AppDatabase? = nil) throws -> AppContainer {
+        let database = try existingDatabase ?? AppDatabase()
         let llm = RoutingLLMClient(database: database)
         let startupIssues: [String]
         let messagesStore: any MessagesStoreProtocol
+        let messagesDirectoryAccess = MessagesDirectoryAccessStore.load()
         do {
-            messagesStore = try MessagesStoreReader()
+            messagesStore = try MessagesStoreReader(messagesDirectoryAccess: messagesDirectoryAccess)
             startupIssues = []
         } catch {
             messagesStore = RestrictedMessagesStore(errorMessage: error.localizedDescription)
             startupIssues = [
-                "Messages history is unavailable: \(error.localizedDescription). Grant Full Disk Access if you want local conversation loading."
+                "Messages history is unavailable: \(error.localizedDescription). Grant Full Disk Access or choose the Messages folder if you want local conversation loading."
             ]
         }
         let sender = MessagesSender()
@@ -51,7 +53,8 @@ struct AppContainer {
             memory: memory,
             policy: policy,
             autonomy: autonomy,
-            startupIssues: startupIssues
+            startupIssues: startupIssues,
+            messagesDirectoryAccess: messagesDirectoryAccess
         )
     }
 
@@ -84,7 +87,8 @@ struct AppContainer {
             memory: memory,
             policy: policy,
             autonomy: autonomy,
-            startupIssues: []
+            startupIssues: [],
+            messagesDirectoryAccess: nil
         )
     }
 }

@@ -137,6 +137,9 @@ struct OnboardingView: View {
                         await model.refreshConversations()
                     }
                 }
+                Button(model.messagesDirectoryAccessPath == nil ? "Choose Messages Folder" : "Choose Messages Folder Again") {
+                    Task { await model.chooseMessagesFolder() }
+                }
                 Text("Responder does not upload conversations, memories, summaries, or logs.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -238,7 +241,8 @@ struct OnboardingView: View {
 
             GroupBox("Setup summary") {
                 VStack(alignment: .leading, spacing: 10) {
-                    summaryRow(title: "Messages history", value: model.messagesAccessRestricted ? "Restricted until Full Disk Access is granted" : "Available")
+                    summaryRow(title: "Messages history", value: model.messagesAccessRestricted ? "Restricted until access is granted" : "Available")
+                    summaryRow(title: "Messages folder access", value: model.messagesDirectoryAccessPath ?? "Using Full Disk Access only")
                     summaryRow(title: "\(model.selectedProvider.displayName) model", value: model.selectedModel?.name ?? "None selected")
                     summaryRow(title: "Voice profile", value: profileSummary.isEmpty ? "Not seeded yet" : profileSummary)
                     summaryRow(title: "Monitoring engine", value: model.globalSettings.autonomyEnabled ? "Enabled" : "Off")

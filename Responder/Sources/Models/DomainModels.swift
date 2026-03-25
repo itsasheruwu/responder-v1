@@ -129,6 +129,11 @@ struct ConversationLaunchPreference: Hashable, Codable, Sendable {
     )
 }
 
+struct MessagesDirectoryAccess: Hashable, Codable, Sendable {
+    var directoryPath: String
+    var bookmarkData: Data
+}
+
 struct PromptLayer: Identifiable, Hashable, Codable, Sendable {
     let id: String
     let title: String
@@ -171,6 +176,31 @@ struct MemorySnapshot: Hashable, Codable, Sendable {
         guard !entries.isEmpty else { return "None recorded." }
         return entries.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
     }
+}
+
+enum MemorySyncSource: String, Hashable, Codable, Sendable {
+    case manual
+    case openRouter
+    case heuristic
+    case acceptedDraft
+
+    var displayName: String {
+        switch self {
+        case .manual:
+            return "Manual"
+        case .openRouter:
+            return "OpenRouter"
+        case .heuristic:
+            return "Heuristic"
+        case .acceptedDraft:
+            return "Draft Feedback"
+        }
+    }
+}
+
+struct MemorySyncMetadata: Hashable, Codable, Sendable {
+    var source: MemorySyncSource
+    var syncedAt: Date
 }
 
 struct UserProfileMemory: Hashable, Codable, Sendable {
@@ -293,7 +323,7 @@ struct AutonomyContactConfig: Hashable, Codable, Sendable {
     var confidenceThreshold: Double
     var quietHoursStartHour: Int
     var quietHoursEndHour: Int
-    var minimumMinutesBetweenSends: Int
+    var minimumSecondsBetweenSends: Int
     var dailySendLimit: Int
     var requiresCompletedSimulation: Bool
     var lastSimulationPassedAt: Date?
@@ -308,11 +338,93 @@ struct AutonomyContactConfig: Hashable, Codable, Sendable {
             confidenceThreshold: 0.88,
             quietHoursStartHour: 22,
             quietHoursEndHour: 7,
-            minimumMinutesBetweenSends: 30,
+            minimumSecondsBetweenSends: 30,
             dailySendLimit: 5,
             requiresCompletedSimulation: true,
             lastSimulationPassedAt: nil
         )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case conversationID
+        case memoryKey
+        case monitoringEnabled
+        case simulationMode
+        case autoSendEnabled
+        case confidenceThreshold
+        case quietHoursStartHour
+        case quietHoursEndHour
+        case minimumSecondsBetweenSends
+        case minimumMinutesBetweenSends
+        case dailySendLimit
+        case requiresCompletedSimulation
+        case lastSimulationPassedAt
+    }
+
+    init(
+        conversationID: String,
+        memoryKey: String,
+        monitoringEnabled: Bool,
+        simulationMode: Bool,
+        autoSendEnabled: Bool,
+        confidenceThreshold: Double,
+        quietHoursStartHour: Int,
+        quietHoursEndHour: Int,
+        minimumSecondsBetweenSends: Int,
+        dailySendLimit: Int,
+        requiresCompletedSimulation: Bool,
+        lastSimulationPassedAt: Date?
+    ) {
+        self.conversationID = conversationID
+        self.memoryKey = memoryKey
+        self.monitoringEnabled = monitoringEnabled
+        self.simulationMode = simulationMode
+        self.autoSendEnabled = autoSendEnabled
+        self.confidenceThreshold = confidenceThreshold
+        self.quietHoursStartHour = quietHoursStartHour
+        self.quietHoursEndHour = quietHoursEndHour
+        self.minimumSecondsBetweenSends = minimumSecondsBetweenSends
+        self.dailySendLimit = dailySendLimit
+        self.requiresCompletedSimulation = requiresCompletedSimulation
+        self.lastSimulationPassedAt = lastSimulationPassedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        conversationID = try container.decode(String.self, forKey: .conversationID)
+        memoryKey = try container.decode(String.self, forKey: .memoryKey)
+        monitoringEnabled = try container.decode(Bool.self, forKey: .monitoringEnabled)
+        simulationMode = try container.decode(Bool.self, forKey: .simulationMode)
+        autoSendEnabled = try container.decode(Bool.self, forKey: .autoSendEnabled)
+        confidenceThreshold = try container.decode(Double.self, forKey: .confidenceThreshold)
+        quietHoursStartHour = try container.decode(Int.self, forKey: .quietHoursStartHour)
+        quietHoursEndHour = try container.decode(Int.self, forKey: .quietHoursEndHour)
+        if let seconds = try container.decodeIfPresent(Int.self, forKey: .minimumSecondsBetweenSends) {
+            minimumSecondsBetweenSends = seconds
+        } else if let legacyMinutes = try container.decodeIfPresent(Int.self, forKey: .minimumMinutesBetweenSends) {
+            minimumSecondsBetweenSends = legacyMinutes * 60
+        } else {
+            minimumSecondsBetweenSends = 30
+        }
+        dailySendLimit = try container.decode(Int.self, forKey: .dailySendLimit)
+        requiresCompletedSimulation = try container.decode(Bool.self, forKey: .requiresCompletedSimulation)
+        lastSimulationPassedAt = try container.decodeIfPresent(Date.self, forKey: .lastSimulationPassedAt)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(conversationID, forKey: .conversationID)
+        try container.encode(memoryKey, forKey: .memoryKey)
+        try container.encode(monitoringEnabled, forKey: .monitoringEnabled)
+        try container.encode(simulationMode, forKey: .simulationMode)
+        try container.encode(autoSendEnabled, forKey: .autoSendEnabled)
+        try container.encode(confidenceThreshold, forKey: .confidenceThreshold)
+        try container.encode(quietHoursStartHour, forKey: .quietHoursStartHour)
+        try container.encode(quietHoursEndHour, forKey: .quietHoursEndHour)
+        try container.encode(minimumSecondsBetweenSends, forKey: .minimumSecondsBetweenSends)
+        try container.encode(dailySendLimit, forKey: .dailySendLimit)
+        try container.encode(requiresCompletedSimulation, forKey: .requiresCompletedSimulation)
+        try container.encodeIfPresent(lastSimulationPassedAt, forKey: .lastSimulationPassedAt)
     }
 }
 
@@ -322,7 +434,7 @@ struct GlobalAutonomySettings: Hashable, Codable, Sendable {
     var defaultQuietHoursStartHour: Int
     var defaultQuietHoursEndHour: Int
     var defaultConfidenceThreshold: Double
-    var defaultMinimumMinutesBetweenSends: Int
+    var defaultMinimumSecondsBetweenSends: Int
     var defaultDailySendLimit: Int
     var monitorPollIntervalSeconds: Int
 
@@ -332,10 +444,72 @@ struct GlobalAutonomySettings: Hashable, Codable, Sendable {
         defaultQuietHoursStartHour: 22,
         defaultQuietHoursEndHour: 7,
         defaultConfidenceThreshold: 0.88,
-        defaultMinimumMinutesBetweenSends: 30,
+        defaultMinimumSecondsBetweenSends: 30,
         defaultDailySendLimit: 5,
         monitorPollIntervalSeconds: 15
     )
+
+    private enum CodingKeys: String, CodingKey {
+        case autonomyEnabled
+        case emergencyStopEnabled
+        case defaultQuietHoursStartHour
+        case defaultQuietHoursEndHour
+        case defaultConfidenceThreshold
+        case defaultMinimumSecondsBetweenSends
+        case defaultMinimumMinutesBetweenSends
+        case defaultDailySendLimit
+        case monitorPollIntervalSeconds
+    }
+
+    init(
+        autonomyEnabled: Bool,
+        emergencyStopEnabled: Bool,
+        defaultQuietHoursStartHour: Int,
+        defaultQuietHoursEndHour: Int,
+        defaultConfidenceThreshold: Double,
+        defaultMinimumSecondsBetweenSends: Int,
+        defaultDailySendLimit: Int,
+        monitorPollIntervalSeconds: Int
+    ) {
+        self.autonomyEnabled = autonomyEnabled
+        self.emergencyStopEnabled = emergencyStopEnabled
+        self.defaultQuietHoursStartHour = defaultQuietHoursStartHour
+        self.defaultQuietHoursEndHour = defaultQuietHoursEndHour
+        self.defaultConfidenceThreshold = defaultConfidenceThreshold
+        self.defaultMinimumSecondsBetweenSends = defaultMinimumSecondsBetweenSends
+        self.defaultDailySendLimit = defaultDailySendLimit
+        self.monitorPollIntervalSeconds = monitorPollIntervalSeconds
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        autonomyEnabled = try container.decodeIfPresent(Bool.self, forKey: .autonomyEnabled) ?? false
+        emergencyStopEnabled = try container.decodeIfPresent(Bool.self, forKey: .emergencyStopEnabled) ?? false
+        defaultQuietHoursStartHour = try container.decodeIfPresent(Int.self, forKey: .defaultQuietHoursStartHour) ?? 22
+        defaultQuietHoursEndHour = try container.decodeIfPresent(Int.self, forKey: .defaultQuietHoursEndHour) ?? 7
+        defaultConfidenceThreshold = try container.decodeIfPresent(Double.self, forKey: .defaultConfidenceThreshold) ?? 0.88
+        if let seconds = try container.decodeIfPresent(Int.self, forKey: .defaultMinimumSecondsBetweenSends) {
+            defaultMinimumSecondsBetweenSends = seconds
+        } else if let legacyMinutes = try container.decodeIfPresent(Int.self, forKey: .defaultMinimumMinutesBetweenSends) {
+            defaultMinimumSecondsBetweenSends = legacyMinutes * 60
+        } else {
+            defaultMinimumSecondsBetweenSends = 30
+        }
+        defaultDailySendLimit = try container.decodeIfPresent(Int.self, forKey: .defaultDailySendLimit) ?? 5
+        monitorPollIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .monitorPollIntervalSeconds) ?? 15
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(autonomyEnabled, forKey: .autonomyEnabled)
+        try container.encode(emergencyStopEnabled, forKey: .emergencyStopEnabled)
+        try container.encode(defaultQuietHoursStartHour, forKey: .defaultQuietHoursStartHour)
+        try container.encode(defaultQuietHoursEndHour, forKey: .defaultQuietHoursEndHour)
+        try container.encode(defaultConfidenceThreshold, forKey: .defaultConfidenceThreshold)
+        try container.encode(defaultMinimumSecondsBetweenSends, forKey: .defaultMinimumSecondsBetweenSends)
+        try container.encode(defaultDailySendLimit, forKey: .defaultDailySendLimit)
+        try container.encode(monitorPollIntervalSeconds, forKey: .monitorPollIntervalSeconds)
+    }
 }
 
 enum OnboardingStep: String, Codable, Sendable, CaseIterable {

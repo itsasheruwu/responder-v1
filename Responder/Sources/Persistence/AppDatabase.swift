@@ -247,6 +247,44 @@ actor AppDatabase {
         }
     }
 
+    func loadDerivedUserProfileMemory() throws -> UserProfileMemory {
+        try dbQueue.read { db in
+            if let row = try Row.fetchOne(db, sql: "SELECT value_json FROM app_settings WHERE key = 'derived_user_profile_memory'") {
+                return try decode(UserProfileMemory.self, from: row["value_json"])
+            }
+            return .empty
+        }
+    }
+
+    func saveDerivedUserProfileMemory(_ memory: UserProfileMemory) throws {
+        try upsertJSON(
+            table: "app_settings",
+            keyColumn: "key",
+            keyValue: "derived_user_profile_memory",
+            jsonColumn: "value_json",
+            value: memory
+        )
+    }
+
+    func loadDerivedUserProfileMemoryMetadata() throws -> MemorySyncMetadata? {
+        try dbQueue.read { db in
+            if let row = try Row.fetchOne(db, sql: "SELECT value_json FROM app_settings WHERE key = 'derived_user_profile_memory_metadata'") {
+                return try decode(MemorySyncMetadata.self, from: row["value_json"])
+            }
+            return nil
+        }
+    }
+
+    func saveDerivedUserProfileMemoryMetadata(_ metadata: MemorySyncMetadata) throws {
+        try upsertJSON(
+            table: "app_settings",
+            keyColumn: "key",
+            keyValue: "derived_user_profile_memory_metadata",
+            jsonColumn: "value_json",
+            value: metadata
+        )
+    }
+
     func loadContactMemory(memoryKey: String, conversationID: String) throws -> ContactMemory {
         try dbQueue.read { db in
             if let row = try Row.fetchOne(db, sql: "SELECT memory_json FROM contact_memory WHERE memory_key = ?", arguments: [memoryKey]) {
@@ -268,6 +306,69 @@ actor AppDatabase {
                     updated_at = excluded.updated_at
                 """,
                 arguments: [memory.memoryKey, conversationID, try encode(memory), Date().timeIntervalSince1970]
+            )
+        }
+    }
+
+    func loadDerivedContactMemory(memoryKey: String) throws -> ContactMemory {
+        try dbQueue.read { db in
+            let key = "derived_contact_memory:\(memoryKey)"
+            if let row = try Row.fetchOne(db, sql: "SELECT value_json FROM app_settings WHERE key = ?", arguments: [key]) {
+                return try decode(ContactMemory.self, from: row["value_json"])
+            }
+            return .empty(memoryKey: memoryKey)
+        }
+    }
+
+    func saveDerivedContactMemory(_ memory: ContactMemory) throws {
+        try upsertJSON(
+            table: "app_settings",
+            keyColumn: "key",
+            keyValue: "derived_contact_memory:\(memory.memoryKey)",
+            jsonColumn: "value_json",
+            value: memory
+        )
+    }
+
+    func loadDerivedContactMemoryMetadata(memoryKey: String) throws -> MemorySyncMetadata? {
+        try dbQueue.read { db in
+            let key = "derived_contact_memory_metadata:\(memoryKey)"
+            if let row = try Row.fetchOne(db, sql: "SELECT value_json FROM app_settings WHERE key = ?", arguments: [key]) {
+                return try decode(MemorySyncMetadata.self, from: row["value_json"])
+            }
+            return nil
+        }
+    }
+
+    func saveDerivedContactMemoryMetadata(_ metadata: MemorySyncMetadata, memoryKey: String) throws {
+        try upsertJSON(
+            table: "app_settings",
+            keyColumn: "key",
+            keyValue: "derived_contact_memory_metadata:\(memoryKey)",
+            jsonColumn: "value_json",
+            value: metadata
+        )
+    }
+
+    func loadMemoryTranscriptFingerprint(conversationID: String) throws -> String? {
+        try dbQueue.read { db in
+            let key = "memory_transcript_fingerprint:\(conversationID)"
+            return try Row.fetchOne(db, sql: "SELECT value_json FROM app_settings WHERE key = ?", arguments: [key])?["value_json"]
+        }
+    }
+
+    func saveMemoryTranscriptFingerprint(_ fingerprint: String, conversationID: String) throws {
+        try dbQueue.write { db in
+            let key = "memory_transcript_fingerprint:\(conversationID)"
+            try db.execute(
+                sql: """
+                INSERT INTO app_settings (key, value_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+                """,
+                arguments: [key, fingerprint, Date().timeIntervalSince1970]
             )
         }
     }

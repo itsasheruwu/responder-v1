@@ -69,7 +69,10 @@ protocol AutonomyCoordinating: Sendable {
     func generateReply(
         conversationID: String,
         modelName: String,
-        mode: ReplyOperationMode
+        mode: ReplyOperationMode,
+        conversation: ConversationRef?,
+        messages: [ChatMessage],
+        contextLimit: Int?
     ) async throws -> DraftGenerationResult
     func sendDraft(_ draft: ReplyDraft, conversationID: String, mode: ReplyOperationMode) async throws
     func monitorCycle(modelName: String, activeConversationID: String?) async throws -> [ActivityLogEntry]

@@ -181,6 +181,120 @@ actor OpenRouterClient {
         )
     }
 
+    func summarizeRelationship(
+        conversation: ConversationRef,
+        messages: [ChatMessage],
+        existingSummary: String,
+        configuration: ProviderConfiguration,
+        modelName: String = "openrouter/free"
+    ) async throws -> String {
+        let transcript = messages.suffix(24).map {
+            let text = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let renderedText = text.isEmpty ? "[no text]" : text
+            return "[\($0.direction.rawValue)] \($0.senderName): \(renderedText)"
+        }.joined(separator: "\n")
+
+        let participantLine: String
+        if conversation.participants.isEmpty {
+            participantLine = conversation.title
+        } else {
+            participantLine = conversation.participants.map(\.displayName).joined(separator: ", ")
+        }
+
+        let prompt = """
+        Write a short relationship summary for contact memory in plain English.
+        Keep it to 1 or 2 sentences.
+        Focus on what relationship the user appears to have with this contact and the communication dynamic that matters for future replies.
+        If the relationship is uncertain, say "seems" or "appears" instead of overstating it.
+        Do not use bullet points, labels, or JSON.
+        Do not mention models, prompts, or internal analysis.
+
+        Conversation title: \(conversation.title)
+        Participants: \(participantLine)
+        Existing relationship summary: \(existingSummary.isEmpty ? "None" : existingSummary)
+
+        Recent transcript:
+        \(transcript.isEmpty ? "No recent transcript." : transcript)
+        """
+
+        let request = try makeChatCompletionRequest(
+            configuration: configuration,
+            modelName: modelName,
+            systemPrompt: "Return only a concise relationship summary in plain English.",
+            userPrompt: prompt,
+            maxTokens: 120,
+            requireJSON: false
+        )
+
+        let text = try await performChatCompletion(request: request)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func deriveMemories(
+        conversation: ConversationRef,
+        messages: [ChatMessage],
+        userMemory: UserProfileMemory,
+        contactMemory: ContactMemory,
+        configuration: ProviderConfiguration,
+        modelName: String = "openrouter/free"
+    ) async throws -> DerivedMemoryResponse {
+        let transcript = messages.suffix(30).map {
+            let text = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let renderedText = text.isEmpty ? "[no text]" : text
+            return "[\($0.direction.rawValue)] \($0.senderName): \(renderedText)"
+        }.joined(separator: "\n")
+
+        let participantLine: String
+        if conversation.participants.isEmpty {
+            participantLine = conversation.title
+        } else {
+            participantLine = conversation.participants.map(\.displayName).joined(separator: ", ")
+        }
+
+        let prompt = """
+        Update the memory state for a messaging assistant from conversation context.
+        Return strict JSON only.
+
+        Rules:
+        - Use plain English.
+        - Keep summaries concise and factual.
+        - Prefer durable patterns over one-off moments.
+        - Leave fields empty when there is not enough evidence.
+        - Do not invent sensitive facts.
+        - Arrays should contain short items, not paragraphs.
+        - Keep no more than 6 items per array.
+
+        Conversation title: \(conversation.title)
+        Participants: \(participantLine)
+
+        Existing user memory:
+        \(serializeUserMemory(userMemory))
+
+        Existing contact memory:
+        \(serializeContactMemory(contactMemory))
+
+        Recent transcript:
+        \(transcript.isEmpty ? "No recent transcript." : transcript)
+        """
+
+        let request = try makeChatCompletionRequest(
+            configuration: configuration,
+            modelName: modelName,
+            systemPrompt: """
+            Return JSON with exactly these keys:
+            userProfileSummary, userStyleTraits, userBannedPhrases, userBackgroundFacts, userReplyHabits,
+            contactRelationshipSummary, contactPreferences, contactRecurringTopics, contactBoundaries, contactNotes.
+            """,
+            userPrompt: prompt,
+            maxTokens: 320,
+            requireJSON: true
+        )
+
+        let payload = try await performChatCompletion(request: request)
+        let jsonText = Self.extractJSONObject(from: payload) ?? payload
+        return try decodeDerivedMemoryResponse(from: jsonText, decoder: decoder)
+    }
+
     private func makeRequest(path: String, configuration: ProviderConfiguration, method: String) throws -> URLRequest {
         guard !configuration.openRouterAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ResponderError.openRouterMissingAPIKey
@@ -284,6 +398,61 @@ actor OpenRouterClient {
 
         let normalized = try JSONSerialization.data(withJSONObject: object, options: [])
         return try decoder.decode(ModelDraftResponse.self, from: normalized)
+    }
+
+    private func decodeDerivedMemoryResponse(from text: String, decoder: JSONDecoder) throws -> DerivedMemoryResponse {
+        if let direct = try? decoder.decode(DerivedMemoryResponse.self, from: Data(text.utf8)) {
+            return direct
+        }
+
+        let decoded = try JSONSerialization.jsonObject(with: Data(text.utf8))
+        guard var object = decoded as? [String: Any], !object.isEmpty else {
+            throw ResponderError.invalidResponse("The memory model did not return valid JSON.")
+        }
+
+        let keys = [
+            "userProfileSummary",
+            "userStyleTraits",
+            "userBannedPhrases",
+            "userBackgroundFacts",
+            "userReplyHabits",
+            "contactRelationshipSummary",
+            "contactPreferences",
+            "contactRecurringTopics",
+            "contactBoundaries",
+            "contactNotes"
+        ]
+
+        for key in keys {
+            if object[key] == nil {
+                object[key] = key.hasSuffix("Summary") ? "" : []
+            } else if let string = object[key] as? String {
+                object[key] = key.hasSuffix("Summary") ? string : Self.splitListString(string)
+            }
+        }
+
+        let data = try JSONSerialization.data(withJSONObject: object, options: [])
+        return try decoder.decode(DerivedMemoryResponse.self, from: data)
+    }
+
+    private func serializeUserMemory(_ memory: UserProfileMemory) -> String {
+        """
+        Profile summary: \(memory.profileSummary.isEmpty ? "None" : memory.profileSummary)
+        Style traits: \(memory.styleTraits.isEmpty ? "None" : memory.styleTraits.joined(separator: ", "))
+        Banned phrases: \(memory.bannedPhrases.isEmpty ? "None" : memory.bannedPhrases.joined(separator: ", "))
+        Background facts: \(memory.backgroundFacts.isEmpty ? "None" : memory.backgroundFacts.joined(separator: ", "))
+        Reply habits: \(memory.replyHabits.isEmpty ? "None" : memory.replyHabits.joined(separator: ", "))
+        """
+    }
+
+    private func serializeContactMemory(_ memory: ContactMemory) -> String {
+        """
+        Relationship summary: \(memory.relationshipSummary.isEmpty ? "None" : memory.relationshipSummary)
+        Preferences: \(memory.preferences.isEmpty ? "None" : memory.preferences.joined(separator: ", "))
+        Recurring topics: \(memory.recurringTopics.isEmpty ? "None" : memory.recurringTopics.joined(separator: ", "))
+        Boundaries: \(memory.boundaries.isEmpty ? "None" : memory.boundaries.joined(separator: ", "))
+        Notes: \(memory.notes.isEmpty ? "None" : memory.notes.joined(separator: ", "))
+        """
     }
 
     private static func extractJSONObject(from text: String) -> String? {
@@ -428,4 +597,17 @@ private struct ModelPolicyResponse: Decodable {
     let confidence: Double
     let reasons: [String]
     let riskFlags: [String]
+}
+
+struct DerivedMemoryResponse: Decodable, Sendable {
+    let userProfileSummary: String
+    let userStyleTraits: [String]
+    let userBannedPhrases: [String]
+    let userBackgroundFacts: [String]
+    let userReplyHabits: [String]
+    let contactRelationshipSummary: String
+    let contactPreferences: [String]
+    let contactRecurringTopics: [String]
+    let contactBoundaries: [String]
+    let contactNotes: [String]
 }

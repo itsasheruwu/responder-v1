@@ -4,29 +4,56 @@ import GRDB
 
 actor MessagesStoreReader: MessagesStoreProtocol {
     private let sourceDatabaseURL: URL
+    private let securityScopedMessagesDirectoryURL: URL?
     private let snapshotRootURL: URL
     private let fileManager: FileManager
     private let contactResolver = ContactNameResolver()
+    private var cachedSnapshot: SnapshotContext?
+    private var cachedSnapshotSignature: SnapshotSignature?
+    private var cachedConversationLists: [Int: [ConversationRef]] = [:]
+    private var cachedConversationByID: [String: ConversationRef] = [:]
+    private var cachedMessageLists: [MessageCacheKey: [ChatMessage]] = [:]
 
-    init(databaseURL: URL = FileManager.default.homeDirectoryForCurrentUser.appending(path: "Library/Messages/chat.db")) throws {
-        sourceDatabaseURL = databaseURL
+    init(messagesDirectoryAccess: MessagesDirectoryAccess? = nil) throws {
         fileManager = .default
         snapshotRootURL = fileManager.temporaryDirectory.appending(path: "ResponderMessagesSnapshots", directoryHint: .isDirectory)
 
         try fileManager.createDirectory(at: snapshotRootURL, withIntermediateDirectories: true)
         Self.cleanupSnapshots(at: snapshotRootURL, fileManager: fileManager)
 
-        let snapshot = try Self.makeSnapshotContext(
-            sourceDatabaseURL: sourceDatabaseURL,
-            snapshotRootURL: snapshotRootURL,
-            fileManager: fileManager
-        )
-        _ = try snapshot.dbQueue.read { _ in true }
-        Self.cleanupSnapshot(at: snapshot.directoryURL, fileManager: fileManager)
+        let defaultMessagesDirectoryURL = fileManager.homeDirectoryForCurrentUser.appending(path: "Library/Messages", directoryHint: .isDirectory)
+        let defaultDatabaseURL = defaultMessagesDirectoryURL.appending(path: "chat.db")
+
+        if fileManager.fileExists(atPath: defaultDatabaseURL.path) {
+            sourceDatabaseURL = defaultDatabaseURL
+            securityScopedMessagesDirectoryURL = nil
+            return
+        }
+
+        guard let messagesDirectoryAccess else {
+            throw Self.makeMessagesAccessError()
+        }
+
+        let resolvedDirectoryURL = try Self.resolveMessagesDirectoryURL(from: messagesDirectoryAccess)
+        let bookmarkedDatabaseURL = resolvedDirectoryURL.appending(path: "chat.db")
+        // `resolveMessagesDirectoryURL` ends security-scoped access before returning; visibility of
+        // `chat.db` for a user-picked folder must be checked while the scope is active.
+        try Self.withMessagesDirectoryAccess(url: resolvedDirectoryURL) {
+            guard FileManager.default.fileExists(atPath: bookmarkedDatabaseURL.path) else {
+                throw Self.makeMessagesAccessError()
+            }
+        }
+
+        sourceDatabaseURL = bookmarkedDatabaseURL
+        securityScopedMessagesDirectoryURL = resolvedDirectoryURL
     }
 
     func fetchConversations(limit: Int) async throws -> [ConversationRef] {
-        try await withSnapshotQueue { [self] dbQueue in
+        if let cached = try cachedConversations(limit: limit) {
+            return cached
+        }
+
+        return try await withSnapshotQueue { [self] dbQueue in
             let rows: [ConversationRow] = try await dbQueue.read { db in
                 let rows = try Row.fetchAll(
                     db,
@@ -80,12 +107,18 @@ actor MessagesStoreReader: MessagesStoreProtocol {
                 return rows.map(Self.makeConversationRow(from:))
             }
 
-            return try await self.hydrateConversations(from: rows, dbQueue: dbQueue)
+            let conversations = rows.map(Self.makeConversationPreview(from:))
+            self.cachedConversationLists[limit] = conversations
+            return conversations
         }
     }
 
     func fetchConversation(id: String) async throws -> ConversationRef? {
-        try await withSnapshotQueue { [self] dbQueue in
+        if let cached = try cachedConversation(id: id) {
+            return cached
+        }
+
+        return try await withSnapshotQueue { [self] dbQueue in
             guard let row = try dbQueue.read({ db in
                 try Row.fetchOne(
                     db,
@@ -139,12 +172,18 @@ actor MessagesStoreReader: MessagesStoreProtocol {
                 return nil
             }
 
-            return try await self.hydrateConversation(from: Self.makeConversationRow(from: row), dbQueue: dbQueue)
+            let conversation = try await self.hydrateConversation(from: Self.makeConversationRow(from: row), dbQueue: dbQueue)
+            self.cachedConversationByID[conversation.id] = conversation
+            return conversation
         }
     }
 
     func fetchMessages(conversationID: String, limit: Int) async throws -> [ChatMessage] {
-        try await withSnapshotQueue { [self] dbQueue in
+        if let cached = try cachedMessages(conversationID: conversationID, limit: limit) {
+            return cached
+        }
+
+        return try await withSnapshotQueue { [self] dbQueue in
             let rows: [MessageRow] = try await dbQueue.read { db in
                 let rows = try Row.fetchAll(
                     db,
@@ -227,6 +266,7 @@ actor MessagesStoreReader: MessagesStoreProtocol {
                 )
             }
 
+            self.cachedMessageLists[MessageCacheKey(conversationID: conversationID, limit: limit)] = messages
             return messages
         }
     }
@@ -295,18 +335,6 @@ actor MessagesStoreReader: MessagesStoreProtocol {
         return participants
     }
 
-    private func hydrateConversations(from rows: [ConversationRow], dbQueue: DatabaseQueue) async throws -> [ConversationRef] {
-        var conversations: [ConversationRef] = []
-        conversations.reserveCapacity(rows.count)
-
-        for row in rows {
-            let conversation = try await hydrateConversation(from: row, dbQueue: dbQueue)
-            conversations.append(conversation)
-        }
-
-        return conversations
-    }
-
     private func hydrateConversation(from row: ConversationRow, dbQueue: DatabaseQueue) async throws -> ConversationRef {
         let participants = try await loadParticipants(chatRowID: row.chatRowID, service: row.service, dbQueue: dbQueue)
         let title = row.displayName?.nonEmpty ?? Self.defaultTitle(
@@ -334,23 +362,84 @@ actor MessagesStoreReader: MessagesStoreProtocol {
     }
 
     private func withSnapshotQueue<T>(_ operation: @escaping (DatabaseQueue) async throws -> T) async throws -> T {
+        let snapshot = try snapshotContext()
+        return try await operation(snapshot.dbQueue)
+    }
+
+    private func snapshotContext() throws -> SnapshotContext {
+        let signature = try Self.makeSnapshotSignature(
+            sourceDatabaseURL: sourceDatabaseURL,
+            securityScopedMessagesDirectoryURL: securityScopedMessagesDirectoryURL,
+            fileManager: fileManager
+        )
+
+        if let cachedSnapshot,
+           let cachedSnapshotSignature,
+           cachedSnapshotSignature == signature,
+           fileManager.fileExists(atPath: cachedSnapshot.directoryURL.path) {
+            return cachedSnapshot
+        }
+
+        if let cachedSnapshot {
+            Self.cleanupSnapshot(at: cachedSnapshot.directoryURL, fileManager: fileManager)
+        }
+        cachedConversationLists.removeAll()
+        cachedConversationByID.removeAll()
+        cachedMessageLists.removeAll()
+
         let snapshot = try Self.makeSnapshotContext(
             sourceDatabaseURL: sourceDatabaseURL,
+            securityScopedMessagesDirectoryURL: securityScopedMessagesDirectoryURL,
             snapshotRootURL: snapshotRootURL,
             fileManager: fileManager
         )
-        do {
-            let result = try await operation(snapshot.dbQueue)
-            Self.cleanupSnapshot(at: snapshot.directoryURL, fileManager: fileManager)
-            return result
-        } catch {
-            Self.cleanupSnapshot(at: snapshot.directoryURL, fileManager: fileManager)
-            throw error
+        cachedSnapshot = snapshot
+        cachedSnapshotSignature = signature
+        return snapshot
+    }
+
+    private func cachedConversations(limit: Int) throws -> [ConversationRef]? {
+        guard try snapshotIsCurrent() else { return nil }
+        return cachedConversationLists[limit]
+    }
+
+    private func cachedConversation(id: String) throws -> ConversationRef? {
+        guard try snapshotIsCurrent() else { return nil }
+        return cachedConversationByID[id]
+    }
+
+    private func cachedMessages(conversationID: String, limit: Int) throws -> [ChatMessage]? {
+        guard try snapshotIsCurrent() else { return nil }
+        return cachedMessageLists[MessageCacheKey(conversationID: conversationID, limit: limit)]
+    }
+
+    private func snapshotIsCurrent() throws -> Bool {
+        guard let cachedSnapshot, let cachedSnapshotSignature else {
+            return false
         }
+
+        let currentSignature = try Self.makeSnapshotSignature(
+            sourceDatabaseURL: sourceDatabaseURL,
+            securityScopedMessagesDirectoryURL: securityScopedMessagesDirectoryURL,
+            fileManager: fileManager
+        )
+        guard currentSignature == cachedSnapshotSignature,
+              fileManager.fileExists(atPath: cachedSnapshot.directoryURL.path) else {
+            Self.cleanupSnapshot(at: cachedSnapshot.directoryURL, fileManager: fileManager)
+            self.cachedSnapshot = nil
+            self.cachedSnapshotSignature = nil
+            cachedConversationLists.removeAll()
+            cachedConversationByID.removeAll()
+            cachedMessageLists.removeAll()
+            return false
+        }
+
+        return true
     }
 
     private static func makeSnapshotContext(
         sourceDatabaseURL: URL,
+        securityScopedMessagesDirectoryURL: URL?,
         snapshotRootURL: URL,
         fileManager: FileManager
     ) throws -> SnapshotContext {
@@ -360,19 +449,21 @@ actor MessagesStoreReader: MessagesStoreProtocol {
         let destinationDatabaseURL = directoryURL.appending(path: sourceDatabaseURL.lastPathComponent)
 
         do {
-            try fileManager.copyItem(at: sourceDatabaseURL, to: destinationDatabaseURL)
-            try copyCompanionIfPresent(
-                suffix: "-wal",
-                sourceDatabaseURL: sourceDatabaseURL,
-                directoryURL: directoryURL,
-                fileManager: fileManager
-            )
-            try copyCompanionIfPresent(
-                suffix: "-shm",
-                sourceDatabaseURL: sourceDatabaseURL,
-                directoryURL: directoryURL,
-                fileManager: fileManager
-            )
+            try withMessagesDirectoryAccess(url: securityScopedMessagesDirectoryURL) {
+                try fileManager.copyItem(at: sourceDatabaseURL, to: destinationDatabaseURL)
+                try copyCompanionIfPresent(
+                    suffix: "-wal",
+                    sourceDatabaseURL: sourceDatabaseURL,
+                    directoryURL: directoryURL,
+                    fileManager: fileManager
+                )
+                try copyCompanionIfPresent(
+                    suffix: "-shm",
+                    sourceDatabaseURL: sourceDatabaseURL,
+                    directoryURL: directoryURL,
+                    fileManager: fileManager
+                )
+            }
 
             var configuration = Configuration()
             configuration.readonly = true
@@ -384,6 +475,78 @@ actor MessagesStoreReader: MessagesStoreProtocol {
             cleanupSnapshot(at: directoryURL, fileManager: fileManager)
             throw error
         }
+    }
+
+    private static func makeSnapshotSignature(
+        sourceDatabaseURL: URL,
+        securityScopedMessagesDirectoryURL: URL?,
+        fileManager: FileManager
+    ) throws -> SnapshotSignature {
+        try withMessagesDirectoryAccess(url: securityScopedMessagesDirectoryURL) {
+            SnapshotSignature(
+                database: try fileSignature(for: sourceDatabaseURL, fileManager: fileManager),
+                wal: try optionalFileSignature(for: URL(fileURLWithPath: sourceDatabaseURL.path + "-wal"), fileManager: fileManager),
+                shm: try optionalFileSignature(for: URL(fileURLWithPath: sourceDatabaseURL.path + "-shm"), fileManager: fileManager)
+            )
+        }
+    }
+
+    private static func fileSignature(for url: URL, fileManager: FileManager) throws -> FileSignature {
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        return FileSignature(
+            modificationDate: attributes[.modificationDate] as? Date,
+            fileSize: (attributes[.size] as? NSNumber)?.int64Value
+        )
+    }
+
+    private static func optionalFileSignature(for url: URL, fileManager: FileManager) throws -> FileSignature? {
+        guard fileManager.fileExists(atPath: url.path) else {
+            return nil
+        }
+        return try fileSignature(for: url, fileManager: fileManager)
+    }
+
+    private static func resolveMessagesDirectoryURL(from access: MessagesDirectoryAccess) throws -> URL {
+        var isStale = false
+        let url = try URL(
+            resolvingBookmarkData: access.bookmarkData,
+            options: [.withSecurityScope],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        )
+
+        guard url.startAccessingSecurityScopedResource() else {
+            throw makeMessagesAccessError(detail: "Responder could not reopen the saved Messages folder permission.")
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+
+        if isStale {
+            _ = try? MessagesDirectoryAccessStore.save(directoryURL: url)
+        }
+
+        return url
+    }
+
+    private static func withMessagesDirectoryAccess<T>(url: URL?, operation: () throws -> T) throws -> T {
+        guard let url else {
+            return try operation()
+        }
+
+        guard url.startAccessingSecurityScopedResource() else {
+            throw makeMessagesAccessError(detail: "Responder could not reopen the saved Messages folder permission.")
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+
+        return try operation()
+    }
+
+    private static func makeMessagesAccessError(detail: String? = nil) -> NSError {
+        let message = detail ?? "Responder does not currently have permission to read ~/Library/Messages/chat.db."
+        return NSError(
+            domain: "MessagesStoreReader",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
     }
 
     private static func copyCompanionIfPresent(
@@ -432,6 +595,44 @@ actor MessagesStoreReader: MessagesStoreProtocol {
             lastDateRaw: row["last_date"],
             unreadCount: row["unread_count"] ?? 0
         )
+    }
+
+    private static func makeConversationPreview(from row: ConversationRow) -> ConversationRef {
+        let participants = previewParticipants(from: row)
+        let title = row.displayName?.nonEmpty ?? defaultTitle(
+            chatIdentifier: row.chatIdentifier,
+            participants: participants
+        )
+        let normalized = normalizeMessageText(
+            rawText: row.previewText,
+            attributedBody: row.previewAttributedBody,
+            hasAttachment: row.previewHasAttachments,
+            itemType: row.previewItemType,
+            hasAssociatedContent: row.previewAssociatedGuid != nil
+        )
+
+        return ConversationRef(
+            id: row.guid,
+            title: title,
+            service: row.service,
+            participants: participants,
+            isGroup: isGroupConversation(participants: participants, style: row.style),
+            lastMessagePreview: normalized.text,
+            lastMessageDate: appleDate(rawValue: row.lastDateRaw),
+            unreadCount: row.unreadCount
+        )
+    }
+
+    private static func previewParticipants(from row: ConversationRow) -> [Participant] {
+        guard row.style == 45,
+              let handle = row.chatIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !handle.isEmpty
+        else {
+            return []
+        }
+
+        let displayName = row.displayName?.nonEmpty ?? handle
+        return [Participant(handle: handle, displayName: displayName, service: row.service)]
     }
 
     private static func defaultTitle(chatIdentifier: String?, participants: [Participant]) -> String {
@@ -539,6 +740,22 @@ private struct MessageRow: Sendable {
 private struct SnapshotContext {
     let directoryURL: URL
     let dbQueue: DatabaseQueue
+}
+
+private struct SnapshotSignature: Equatable {
+    let database: FileSignature
+    let wal: FileSignature?
+    let shm: FileSignature?
+}
+
+private struct FileSignature: Equatable {
+    let modificationDate: Date?
+    let fileSize: Int64?
+}
+
+private struct MessageCacheKey: Hashable {
+    let conversationID: String
+    let limit: Int
 }
 
 actor ContactNameResolver {

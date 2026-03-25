@@ -5,6 +5,11 @@ actor OllamaClient: OllamaClientProtocol {
     private let session: URLSession
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    private var cachedModels: [OllamaModelInfo]?
+    private var cachedModelsAt: Date?
+    private var modelDetailsCache: [String: OllamaModelInfo] = [:]
+
+    private let modelsCacheTTL: TimeInterval = 30
 
     init(baseURL: URL = URL(string: "http://127.0.0.1:11434")!, session: URLSession = .shared) {
         self.baseURL = baseURL
@@ -14,12 +19,17 @@ actor OllamaClient: OllamaClientProtocol {
     }
 
     func listModels() async throws -> [OllamaModelInfo] {
+        if let cachedModels, let cachedModelsAt,
+           Date().timeIntervalSince(cachedModelsAt) < modelsCacheTTL {
+            return cachedModels
+        }
+
         let request = URLRequest(url: baseURL.appending(path: "/api/tags"))
         let (data, response) = try await session.data(for: request)
         try validate(response: response)
 
         let payload = try decoder.decode(TagsResponse.self, from: data)
-        return payload.models.map {
+        let models = payload.models.map {
             OllamaModelInfo(
                 name: $0.name,
                 digest: $0.digest,
@@ -28,9 +38,16 @@ actor OllamaClient: OllamaClientProtocol {
                 contextLimit: 4096
             )
         }.sorted { $0.name < $1.name }
+        cachedModels = models
+        cachedModelsAt = .now
+        return models
     }
 
     func modelDetails(for modelName: String) async throws -> OllamaModelInfo {
+        if let cached = modelDetailsCache[modelName] {
+            return cached
+        }
+
         var request = URLRequest(url: baseURL.appending(path: "/api/show"))
         request.httpMethod = "POST"
         request.httpBody = try encoder.encode(["model": modelName])
@@ -42,13 +59,27 @@ actor OllamaClient: OllamaClientProtocol {
         let payload = try decoder.decode(ModelShowResponse.self, from: data)
         let parsedContext = Self.parseContextLimit(from: payload.parameters) ?? Self.parseContextLimit(from: payload.template) ?? 4096
 
-        return OllamaModelInfo(
+        let details = OllamaModelInfo(
             name: payload.model,
             digest: payload.digest,
             sizeBytes: nil,
             modifiedAt: nil,
             contextLimit: parsedContext
         )
+        modelDetailsCache[modelName] = details
+        if let cachedModels,
+           let index = cachedModels.firstIndex(where: { $0.name == details.name }) {
+            var updatedModels = cachedModels
+            updatedModels[index] = OllamaModelInfo(
+                name: cachedModels[index].name,
+                digest: cachedModels[index].digest ?? details.digest,
+                sizeBytes: cachedModels[index].sizeBytes ?? details.sizeBytes,
+                modifiedAt: cachedModels[index].modifiedAt ?? details.modifiedAt,
+                contextLimit: details.contextLimit
+            )
+            self.cachedModels = updatedModels
+        }
+        return details
     }
 
     func generateReplyJSON(modelName: String, prompt: PromptPacket) async throws -> ReplyDraft {

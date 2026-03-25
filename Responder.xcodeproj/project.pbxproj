@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		09BF3048CC0819AB38B40420 /* RoutingLLMClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = D4147C9C88C1C8A54EE64D45 /* RoutingLLMClient.swift */; };
 		1649F3D820B402BF71AB1616 /* OpenRouterClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3940D402B2EB3378F1307380 /* OpenRouterClient.swift */; };
+		1A986A05B0C07816446CF817 /* MessagesDirectoryAccessStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 473B6FF4EF8B39C58FDCD85D /* MessagesDirectoryAccessStore.swift */; };
 		1EE19E6F1033CF9C9DEFCB06 /* GRDB in Frameworks */ = {isa = PBXBuildFile; productRef = 035B459A3EDE63FCDC83DC32 /* GRDB */; };
 		216FCD85466793A3B0CD92A6 /* OllamaClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC58B9CEF34AD7547D354FA2 /* OllamaClient.swift */; };
 		219D9A3C7A95AA959EF66CD2 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B65ADF34EFAD53ECB82C7CC /* RootView.swift */; };
@@ -62,6 +63,7 @@
 		1FA8EA705EB2DB83DBCAB6B5 /* ResponderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ResponderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3940D402B2EB3378F1307380 /* OpenRouterClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenRouterClient.swift; sourceTree = "<group>"; };
 		3CF78FE779CF650FFA4D3050 /* MemoryEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryEngine.swift; sourceTree = "<group>"; };
+		473B6FF4EF8B39C58FDCD85D /* MessagesDirectoryAccessStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesDirectoryAccessStore.swift; sourceTree = "<group>"; };
 		517F8656D404C03D86DA8568 /* ResponderUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ResponderUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7DDA6425BC2391081619C823 /* ActivityLogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityLogView.swift; sourceTree = "<group>"; };
 		7F47B1E9937941B5A2DBCAAA /* ContextManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContextManager.swift; sourceTree = "<group>"; };
@@ -169,6 +171,7 @@
 				920C3319A63E2FF0E3F348F1 /* AutonomyEngine.swift */,
 				7F47B1E9937941B5A2DBCAAA /* ContextManager.swift */,
 				3CF78FE779CF650FFA4D3050 /* MemoryEngine.swift */,
+				473B6FF4EF8B39C58FDCD85D /* MessagesDirectoryAccessStore.swift */,
 				908F1A994034212257A7F8F2 /* MessagesSender.swift */,
 				C04BEB6F29FD8EC23E3C9D1A /* MessagesStoreReader.swift */,
 				AC58B9CEF34AD7547D354FA2 /* OllamaClient.swift */,
@@ -339,6 +342,7 @@
 				B5B2D68DD4D85170D8DDF1CD /* DomainModels.swift in Sources */,
 				E778AE515196869662D2273F /* MemoryEngine.swift in Sources */,
 				BF4C0DE46AE3B64202A76F89 /* MemoryInspectorView.swift in Sources */,
+				1A986A05B0C07816446CF817 /* MessagesDirectoryAccessStore.swift in Sources */,
 				41AD7CD3933400D8F7B2DE35 /* MessagesSender.swift in Sources */,
 				284D5C3EA776823BC1479118 /* MessagesStoreReader.swift in Sources */,
 				216FCD85466793A3B0CD92A6 /* OllamaClient.swift in Sources */,

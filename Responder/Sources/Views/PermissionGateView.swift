@@ -9,7 +9,7 @@ struct PermissionGateView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Prepare Local Access")
                     .font(.largeTitle.weight(.semibold))
-                Text("Before setup starts, you can open the macOS privacy panes for Messages history and sending permissions. After granting access, restart Responder and then begin onboarding.")
+                Text("Before setup starts, you can open the macOS privacy panes for Messages history and sending permissions. After granting access, restart Responder and then begin onboarding. macOS applies Full Disk Access per user login and per app path—switching accounts or opening a different copy (for example from Xcode vs /Applications) means choosing Responder again in System Settings for that setup.")
                     .foregroundStyle(.secondary)
             }
 
@@ -21,6 +21,14 @@ struct PermissionGateView: View {
                         actionTitle: "Open Full Disk Access"
                     ) {
                         openSystemSettings(anchor: "Privacy_AllFiles")
+                    }
+
+                    permissionRow(
+                        title: "Messages Folder Access",
+                        detail: model.messagesDirectoryAccessPath ?? "Fallback access if Full Disk Access still does not let Responder read chat.db.",
+                        actionTitle: model.messagesDirectoryAccessPath == nil ? "Choose Messages Folder" : "Choose Again"
+                    ) {
+                        Task { await model.chooseMessagesFolder() }
                     }
 
                     permissionRow(
@@ -37,6 +45,7 @@ struct PermissionGateView: View {
             GroupBox("What happens next") {
                 VStack(alignment: .leading, spacing: 10) {
                     Label("Grant permissions if you want live Messages access or sending", systemImage: "lock.shield")
+                    Label("If Full Disk Access still fails, choose the Messages folder directly", systemImage: "folder.badge.gearshape")
                     Label("Restart Responder after changing Full Disk Access", systemImage: "arrow.clockwise")
                     Label("Then start onboarding to choose a model, seed voice memory, and review autonomy defaults", systemImage: "list.bullet.rectangle")
                 }

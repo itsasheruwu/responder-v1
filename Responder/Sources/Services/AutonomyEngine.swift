@@ -33,18 +33,49 @@ actor AutonomyEngine: AutonomyCoordinating {
     func generateReply(
         conversationID: String,
         modelName: String,
-        mode: ReplyOperationMode
+        mode: ReplyOperationMode,
+        conversation providedConversation: ConversationRef? = nil,
+        messages providedMessages: [ChatMessage] = [],
+        contextLimit providedContextLimit: Int? = nil
     ) async throws -> DraftGenerationResult {
-        guard let conversation = try await store.fetchConversation(id: conversationID) else {
+        let conversation: ConversationRef
+        if let providedConversation {
+            conversation = providedConversation
+        } else if let fetchedConversation = try await store.fetchConversation(id: conversationID) {
+            conversation = fetchedConversation
+        } else {
             throw ResponderError.conversationUnavailable
         }
 
-        let messages = try await store.fetchMessages(conversationID: conversationID, limit: 80)
-        let userMemory = try await memory.loadUserProfileMemory()
-        let contactMemory = try await memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
-        let existingSummary = try await memory.loadSummary(conversationID: conversation.id)
-        let selectedModel = try? await database.loadSelectedModel()
-        let contextLimit = selectedModel?.model.name == modelName ? selectedModel?.model.contextLimit ?? 4096 : ((try? await ollama.modelDetails(for: modelName).contextLimit) ?? 4096)
+        let messages: [ChatMessage]
+        if providedMessages.isEmpty {
+            messages = try await store.fetchMessages(conversationID: conversationID, limit: 80)
+        } else {
+            messages = providedMessages
+        }
+        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+
+        async let userMemoryTask = memory.loadUserProfileMemory()
+        async let contactMemoryTask = memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
+        async let existingSummaryTask = memory.loadSummary(conversationID: conversation.id)
+        async let selectedModelTask = database.loadSelectedModel()
+        async let configTask = database.loadAutonomyConfig(conversationID: conversation.id, memoryKey: conversation.memoryKey)
+        async let globalSettingsTask = database.loadGlobalSettings()
+
+        let userMemory = try await userMemoryTask
+        let contactMemory = try await contactMemoryTask
+        let existingSummary = try await existingSummaryTask
+        let selectedModel = try? await selectedModelTask
+        let contextLimit: Int
+        if let providedContextLimit {
+            contextLimit = providedContextLimit
+        } else if selectedModel?.model.name == modelName {
+            contextLimit = selectedModel?.model.contextLimit ?? 4096
+        } else if let details = try? await ollama.modelDetails(for: modelName) {
+            contextLimit = details.contextLimit
+        } else {
+            contextLimit = 4096
+        }
         let updatedSummary = try await summarizer.compactIfNeeded(
             modelName: modelName,
             conversation: conversation,
@@ -73,8 +104,8 @@ actor AutonomyEngine: AutonomyCoordinating {
             createdAt: draft.createdAt,
             modelName: modelName
         )
-        let config = try await database.loadAutonomyConfig(conversationID: conversation.id, memoryKey: conversation.memoryKey)
-        let global = try await database.loadGlobalSettings()
+        let config = try await configTask
+        let global = try await globalSettingsTask
         let decision = try await policy.evaluate(
             mode: mode,
             conversation: conversation,
