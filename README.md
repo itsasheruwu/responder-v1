@@ -1,16 +1,24 @@
 # Responder
 
-Responder is a native macOS SwiftUI app that drafts iMessage replies using a local Ollama model, keeps memory and logs on-device, and offers opt-in autonomy controls with simulation and policy gates.
+Responder is a native macOS SwiftUI app that drafts iMessage replies using **local Ollama** or **OpenRouter** (optional), keeps memory and logs on-device, and offers opt-in autonomy controls with simulation and policy gates.
 
 ## Install
 
-Download the latest release assets from GitHub or run:
+Download release assets from [GitHub Releases](https://github.com/itsasheruwu/responder-v1/releases) or run:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/itsasheruwu/responder-v1/main/install.sh | bash
 ```
 
-The installer pulls the latest `Responder.app.zip` release and installs `Responder.app` into `/Applications`.
+The script downloads **`Responder.app.zip` from the latest published GitHub Release** (not necessarily the newest commit on `main`) and copies `Responder.app` into `/Applications`.
+
+Install a **specific** version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/itsasheruwu/responder-v1/main/install.sh | bash -s v1.0.2
+```
+
+After installing, run Responder once from `/Applications` so macOS privacy dialogs and Full Disk Access apply to that copy.
 
 ## What Is Implemented
 
@@ -23,6 +31,7 @@ The installer pulls the latest `Responder.app.zip` release and installs `Respond
   - memory inspector/editor
   - per-contact autonomy settings
   - local activity log
+- **LLM providers:** local **Ollama** (default) or **OpenRouter** with an API key in Settings
 - Local persistence with SQLite via GRDB for:
   - selected model
   - user profile memory
@@ -34,7 +43,7 @@ The installer pulls the latest `Responder.app.zip` release and installs `Respond
   - simulation runs
   - monitor cursors
 - Actor-backed services for:
-  - Ollama integration
+  - Ollama and OpenRouter integration
   - Messages history access
   - Messages send automation
   - prompt assembly
@@ -69,24 +78,24 @@ Run the UI smoke test:
 xcodebuild -project Responder.xcodeproj -scheme Responder -destination 'platform=macOS' -only-testing:ResponderUITests/ResponderUITests/testAppLaunches test
 ```
 
-Build the local release artifacts:
+Build local release artifacts (version comes from `VERSION` or `scripts/release.sh`; current default is **1.0.2**):
 
 ```bash
 ./scripts/release.sh
 ```
 
-That script generates:
+That script generates, for the configured version:
 
-- `release/1.0.1/Responder.app.zip`
-- `release/1.0.1/Responder-1.0.1.pkg`
-- `release/1.0.1/install.sh`
+- `release/<version>/Responder.app.zip`
+- `release/<version>/Responder-<version>.pkg`
+- `release/<version>/install.sh`
 
 ## Local Runtime Requirements
 
 - macOS 15 or later
-- Ollama running locally on `http://127.0.0.1:11434`
-- A local Messages history database at `~/Library/Messages/chat.db`
-- Permission to automate Messages if you want sending or real autonomy
+- **Drafts:** either **Ollama** on `http://127.0.0.1:11434`, or **OpenRouter** with a valid API key and network access (configure in Settings)
+- A local Messages history database at `~/Library/Messages/chat.db` (same macOS user that runs the app), or use **Choose Messages Folder** in the permission gate / Settings if Full Disk Access alone is not enough
+- **Automation** permission if you want sending or real autonomy through the Messages app
 
 ## macOS And iMessage Limitations
 
@@ -133,13 +142,20 @@ Best workaround:
 - Keep App Sandbox disabled for this build target
 - Ask the user to grant only the permissions needed for local history access and optional sending
 
-### 4. Full Disk Access may be needed for reliable Messages DB reads
+### 4. Full Disk Access and the Messages folder
 
-Depending on macOS privacy settings, reading `~/Library/Messages/chat.db` may require broader filesystem access.
+Depending on macOS privacy settings, reading `~/Library/Messages/chat.db` may require **Full Disk Access** to the app you actually launch.
+
+Important details:
+
+- Privacy entries are **per macOS user**. If you use several accounts on one Mac, enable Full Disk Access (and Automation, if needed) while logged into **that** user.
+- They are also **per app path and signature**. The binary in `/Applications/Responder.app` is different from a Debug build opened from Xcode or DerivedData—add the one you use to **System Settings → Privacy & Security → Full Disk Access**.
+- If access is still blocked after enabling FDA, use **Choose Messages Folder** in the app to grant read access to the folder that contains `chat.db`.
 
 Best workaround:
 
-- Instruct the user to grant Full Disk Access to Responder if conversation loading fails
+- Grant Full Disk Access to Responder if conversation loading fails, then **restart the app**
+- Optionally pick the `Library/Messages` folder (or the folder that contains `chat.db`) when prompted
 - Keep the app’s own database in `~/Library/Application Support/Responder/responder.sqlite`
 - Never write to Apple’s Messages database
 
@@ -159,5 +175,6 @@ Best workaround:
 ## Notes
 
 - This MVP is intentionally text-first.
-- Ollama failures degrade the app into view-only/manual mode rather than attempting remote fallback.
+- When Ollama is selected, failures degrade the app into view-only/manual mode rather than switching to cloud without your configuration.
+- OpenRouter sends prompt and context data to the configured cloud endpoint—use it only when that tradeoff is acceptable.
 - All logs, memories, drafts, and summaries remain local to the machine.
