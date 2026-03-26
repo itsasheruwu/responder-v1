@@ -142,7 +142,8 @@ actor OpenRouterClient {
         draft: ReplyDraft,
         configuration: ProviderConfiguration
     ) async throws -> PolicyDecision? {
-        let transcript = messages.suffix(8).map {
+        let windowed = MemoryTranscriptWindow.recentMessagesForDerivation(messages, maxCount: 8, maxAge: nil)
+        let transcript = windowed.map {
             "[\($0.direction.rawValue)] \($0.senderName): \($0.text)"
         }.joined(separator: "\n")
 
@@ -188,7 +189,8 @@ actor OpenRouterClient {
         configuration: ProviderConfiguration,
         modelName: String = "openrouter/free"
     ) async throws -> String {
-        let transcript = messages.suffix(24).map {
+        let windowed = MemoryTranscriptWindow.recentMessagesForDerivation(messages, maxCount: 24, maxAge: nil)
+        let transcript = windowed.map {
             let text = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let renderedText = text.isEmpty ? "[no text]" : text
             return "[\($0.direction.rawValue)] \($0.senderName): \(renderedText)"
@@ -230,6 +232,26 @@ actor OpenRouterClient {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Batched OpenAI-style embeddings (`POST /embeddings`). Vectors are ordered to match `texts`.
+    func embeddingVectors(for texts: [String], configuration: ProviderConfiguration, modelName: String) async throws -> [[Float]] {
+        guard !texts.isEmpty else { return [] }
+        var combined: [[Float]] = []
+        combined.reserveCapacity(texts.count)
+        let batchSize = 32
+        var offset = 0
+        while offset < texts.count {
+            let end = min(offset + batchSize, texts.count)
+            let chunk = Array(texts[offset..<end])
+            let batch = try await embeddingBatch(texts: chunk, configuration: configuration, modelName: modelName)
+            guard batch.count == chunk.count else {
+                throw ResponderError.openRouterUnavailable
+            }
+            combined.append(contentsOf: batch)
+            offset = end
+        }
+        return combined
+    }
+
     func deriveMemories(
         conversation: ConversationRef,
         messages: [ChatMessage],
@@ -238,7 +260,8 @@ actor OpenRouterClient {
         configuration: ProviderConfiguration,
         modelName: String = "openrouter/free"
     ) async throws -> DerivedMemoryResponse {
-        let transcript = messages.suffix(30).map {
+        // Caller passes an already windowed transcript; keep order as given (chronological).
+        let transcript = messages.map {
             let text = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
             let renderedText = text.isEmpty ? "[no text]" : text
             return "[\($0.direction.rawValue)] \($0.senderName): \(renderedText)"
@@ -341,6 +364,25 @@ actor OpenRouterClient {
             throw ResponderError.openRouterUnavailable
         }
         return content
+    }
+
+    private func embeddingBatch(texts: [String], configuration: ProviderConfiguration, modelName: String) async throws -> [[Float]] {
+        var request = try makeRequest(path: "/embeddings", configuration: configuration, method: "POST")
+        let body = OpenRouterEmbeddingsRequest(model: modelName, input: texts)
+        request.httpBody = try encoder.encode(body)
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response)
+        let payload = try decoder.decode(OpenRouterEmbeddingsResponse.self, from: data)
+        guard payload.data.count == texts.count else {
+            throw ResponderError.openRouterUnavailable
+        }
+        if payload.data.allSatisfy({ $0.index != nil }) {
+            return payload.data
+                .map { (idx: $0.index!, vec: $0.embeddingFloats) }
+                .sorted { $0.idx < $1.idx }
+                .map(\.vec)
+        }
+        return payload.data.map(\.embeddingFloats)
     }
 
     private func validate(response: URLResponse) throws {
@@ -486,6 +528,77 @@ actor OpenRouterClient {
     }
 }
 
+enum EmbeddingVectorMath: Sendable {
+    static func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var dot: Float = 0
+        var na: Float = 0
+        var nb: Float = 0
+        for i in a.indices {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        let denom = sqrt(na) * sqrt(nb)
+        guard denom > 0 else { return 0 }
+        return dot / denom
+    }
+}
+
+struct OpenRouterEmbeddingMemoryRetriever: MemoryRetrieving {
+    private let client: OpenRouterClient
+    private let configuration: ProviderConfiguration
+    private let embeddingModel: String
+
+    init(client: OpenRouterClient, configuration: ProviderConfiguration, embeddingModel: String) {
+        self.client = client
+        self.configuration = configuration
+        self.embeddingModel = embeddingModel
+    }
+
+    func rankItems(_ items: [MemoryItem], against recentMessages: [ChatMessage]) async throws -> [MemoryItem] {
+        guard !items.isEmpty else { return [] }
+        do {
+            return try await rankWithEmbeddings(items, recentMessages: recentMessages)
+        } catch {
+            return try await KeywordOverlapMemoryRetriever().rankItems(items, against: recentMessages)
+        }
+    }
+
+    private func rankWithEmbeddings(_ items: [MemoryItem], recentMessages: [ChatMessage]) async throws -> [MemoryItem] {
+        let window = MemoryTranscriptWindow.recentMessagesForDerivation(
+            recentMessages,
+            maxCount: MemoryTranscriptWindow.defaultMaxMessageCount,
+            maxAge: nil
+        )
+        let suffix = Array(window.suffix(12))
+        let queryText = suffix.map { "\($0.senderName): \($0.text)" }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if queryText.isEmpty {
+            return try await KeywordOverlapMemoryRetriever().rankItems(items, against: recentMessages)
+        }
+        let inputs = [queryText] + items.map(\.text)
+        let vectors = try await client.embeddingVectors(for: inputs, configuration: configuration, modelName: embeddingModel)
+        guard vectors.count == inputs.count, let queryVec = vectors.first, !queryVec.isEmpty else {
+            return try await KeywordOverlapMemoryRetriever().rankItems(items, against: recentMessages)
+        }
+        let itemVectors = Array(vectors.dropFirst())
+        guard itemVectors.count == items.count else {
+            return try await KeywordOverlapMemoryRetriever().rankItems(items, against: recentMessages)
+        }
+        let scored = zip(items, itemVectors).map { pair -> (MemoryItem, Float) in
+            let sim = pair.1.isEmpty ? Float(0) : EmbeddingVectorMath.cosineSimilarity(queryVec, pair.1)
+            return (pair.0, sim)
+        }
+        return scored.sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            if lhs.0.updatedAt != rhs.0.updatedAt { return lhs.0.updatedAt > rhs.0.updatedAt }
+            return lhs.0.id.uuidString < rhs.0.id.uuidString
+        }.map(\.0)
+    }
+}
+
 private struct OpenRouterModelsResponse: Decodable {
     let data: [OpenRouterModel]
 }
@@ -510,6 +623,24 @@ private struct OpenRouterModel: Decodable {
         case contextLength = "context_length"
         case topProvider = "top_provider"
     }
+}
+
+private struct OpenRouterEmbeddingsRequest: Encodable {
+    let model: String
+    let input: [String]
+}
+
+private struct OpenRouterEmbeddingsResponse: Decodable {
+    struct Item: Decodable {
+        let embedding: [Double]
+        let index: Int?
+
+        var embeddingFloats: [Float] {
+            embedding.map { Float($0) }
+        }
+    }
+
+    let data: [Item]
 }
 
 private struct OpenRouterChatCompletionRequest: Encodable {

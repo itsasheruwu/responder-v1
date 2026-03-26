@@ -53,18 +53,20 @@ actor AutonomyEngine: AutonomyCoordinating {
         } else {
             messages = providedMessages
         }
-        try await memory.synchronizeMemories(conversation: conversation, messages: messages)
+        _ = try await memory.synchronizeMemories(conversation: conversation, messages: messages)
 
-        async let userMemoryTask = memory.loadUserProfileMemory()
+        async let userMemoryTask = memory.loadUserProfileMemoryForPrompt(memoryKey: conversation.memoryKey)
         async let contactMemoryTask = memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
         async let existingSummaryTask = memory.loadSummary(conversationID: conversation.id)
         async let selectedModelTask = database.loadSelectedModel()
         async let configTask = database.loadAutonomyConfig(conversationID: conversation.id, memoryKey: conversation.memoryKey)
         async let globalSettingsTask = database.loadGlobalSettings()
+        async let providerConfigurationTask = database.loadProviderConfiguration()
 
         let userMemory = try await userMemoryTask
         let contactMemory = try await contactMemoryTask
         let existingSummary = try await existingSummaryTask
+        let providerConfiguration = try await providerConfigurationTask
         let selectedModel = try? await selectedModelTask
         let contextLimit: Int
         if let providedContextLimit {
@@ -83,14 +85,15 @@ actor AutonomyEngine: AutonomyCoordinating {
             existingSummary: existingSummary,
             contextLimit: contextLimit
         )
-        let packet = try contextManager.buildPrompt(
+        let packet = try await contextManager.buildPrompt(
             modelName: modelName,
             conversation: conversation,
             messages: messages,
             userMemory: userMemory,
             contactMemory: contactMemory,
             summary: updatedSummary,
-            contextLimit: contextLimit
+            contextLimit: contextLimit,
+            providerConfiguration: providerConfiguration
         )
         var draft = try await ollama.generateReplyJSON(modelName: modelName, prompt: packet)
         draft = ReplyDraft(

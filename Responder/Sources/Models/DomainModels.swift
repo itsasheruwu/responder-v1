@@ -106,12 +106,58 @@ struct ProviderConfiguration: Hashable, Codable, Sendable {
     var selectedProvider: AIProvider
     var openRouterAPIKey: String
     var openRouterBaseURL: String
+    /// When true and an OpenRouter API key is set, prompt memory selection uses embedding similarity vs recent transcript (falls back to keyword overlap on failure).
+    var useEmbeddingMemoryRetrieval: Bool
+    /// OpenRouter routing id for `/v1/embeddings` (see OpenRouter models list).
+    var memoryEmbeddingModel: String
 
     static let `default` = ProviderConfiguration(
         selectedProvider: .ollama,
         openRouterAPIKey: "",
-        openRouterBaseURL: "https://openrouter.ai/api/v1"
+        openRouterBaseURL: "https://openrouter.ai/api/v1",
+        useEmbeddingMemoryRetrieval: false,
+        memoryEmbeddingModel: "openai/text-embedding-3-small"
     )
+
+    enum CodingKeys: String, CodingKey {
+        case selectedProvider
+        case openRouterAPIKey
+        case openRouterBaseURL
+        case useEmbeddingMemoryRetrieval
+        case memoryEmbeddingModel
+    }
+
+    init(
+        selectedProvider: AIProvider,
+        openRouterAPIKey: String,
+        openRouterBaseURL: String,
+        useEmbeddingMemoryRetrieval: Bool = false,
+        memoryEmbeddingModel: String = "openai/text-embedding-3-small"
+    ) {
+        self.selectedProvider = selectedProvider
+        self.openRouterAPIKey = openRouterAPIKey
+        self.openRouterBaseURL = openRouterBaseURL
+        self.useEmbeddingMemoryRetrieval = useEmbeddingMemoryRetrieval
+        self.memoryEmbeddingModel = memoryEmbeddingModel
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        selectedProvider = try c.decodeIfPresent(AIProvider.self, forKey: .selectedProvider) ?? .ollama
+        openRouterAPIKey = try c.decodeIfPresent(String.self, forKey: .openRouterAPIKey) ?? ""
+        openRouterBaseURL = try c.decodeIfPresent(String.self, forKey: .openRouterBaseURL) ?? "https://openrouter.ai/api/v1"
+        useEmbeddingMemoryRetrieval = try c.decodeIfPresent(Bool.self, forKey: .useEmbeddingMemoryRetrieval) ?? false
+        memoryEmbeddingModel = try c.decodeIfPresent(String.self, forKey: .memoryEmbeddingModel) ?? "openai/text-embedding-3-small"
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(selectedProvider, forKey: .selectedProvider)
+        try c.encode(openRouterAPIKey, forKey: .openRouterAPIKey)
+        try c.encode(openRouterBaseURL, forKey: .openRouterBaseURL)
+        try c.encode(useEmbeddingMemoryRetrieval, forKey: .useEmbeddingMemoryRetrieval)
+        try c.encode(memoryEmbeddingModel, forKey: .memoryEmbeddingModel)
+    }
 }
 
 struct SelectedModelState: Hashable, Codable, Sendable {
@@ -201,68 +247,660 @@ enum MemorySyncSource: String, Hashable, Codable, Sendable {
 struct MemorySyncMetadata: Hashable, Codable, Sendable {
     var source: MemorySyncSource
     var syncedAt: Date
+    /// Non-fatal issue for this sync leg (e.g. OpenRouter derivation failed while heuristics still ran).
+    var lastError: String?
 }
 
+struct MemorySyncOutcome: Hashable, Sendable {
+    var lastOpenRouterDerivationError: String?
+}
+
+/// User-scoped memory as atomic items (manual + derived layers distinguished by `MemoryItem.bucket` on each row).
+/// Legacy JSON used parallel string fields; `Decoder` migrates that shape into `items` on read (see `MemoryItem` / persistence).
 struct UserProfileMemory: Hashable, Codable, Sendable {
-    var profileSummary: String
-    var styleTraits: [String]
-    var bannedPhrases: [String]
-    var backgroundFacts: [String]
-    var replyHabits: [String]
+    var items: [MemoryItem]
 
-    static let empty = UserProfileMemory(profileSummary: "", styleTraits: [], bannedPhrases: [], backgroundFacts: [], replyHabits: [])
+    static let empty = UserProfileMemory(items: [])
 
+    /// Memberwise initializer for tests and tooling (prefers `itemsFromLegacyCodableFields` when migrating strings).
+    init(profileSummary: String, styleTraits: [String], bannedPhrases: [String], backgroundFacts: [String], replyHabits: [String]) {
+        items = Self.migrateLegacyStrings(
+            profileSummary: profileSummary,
+            styleTraits: styleTraits,
+            bannedPhrases: bannedPhrases,
+            backgroundFacts: backgroundFacts,
+            replyHabits: replyHabits,
+            bucket: .manualUser,
+            openRouterMemoryKey: nil
+        )
+    }
+
+    var profileSummary: String {
+        get {
+            mergedSingleLine(kind: .profileSummary, manualBucket: .manualUser, derivedBuckets: [.derivedUserGlobal, .derivedUserOpenRouter])
+        }
+        set { replaceManualScalar(kind: .profileSummary, text: newValue, bucket: .manualUser) }
+    }
+
+    var styleTraits: [String] {
+        get {
+            mergedList(kind: .styleTrait, manualBucket: .manualUser, derivedBuckets: [.derivedUserGlobal, .derivedUserOpenRouter])
+        }
+        set { replaceManualList(kind: .styleTrait, values: newValue, bucket: .manualUser) }
+    }
+
+    var bannedPhrases: [String] {
+        get {
+            mergedList(kind: .bannedPhrase, manualBucket: .manualUser, derivedBuckets: [.derivedUserGlobal, .derivedUserOpenRouter])
+        }
+        set { replaceManualList(kind: .bannedPhrase, values: newValue, bucket: .manualUser) }
+    }
+
+    var backgroundFacts: [String] {
+        get {
+            mergedList(kind: .backgroundFact, manualBucket: .manualUser, derivedBuckets: [.derivedUserGlobal, .derivedUserOpenRouter])
+        }
+        set { replaceManualList(kind: .backgroundFact, values: newValue, bucket: .manualUser) }
+    }
+
+    var replyHabits: [String] {
+        get {
+            mergedList(kind: .replyHabit, manualBucket: .manualUser, derivedBuckets: [.derivedUserGlobal, .derivedUserOpenRouter])
+        }
+        set { replaceManualList(kind: .replyHabit, values: newValue, bucket: .manualUser) }
+    }
+
+    /// Uses merged getters so the same fact is not repeated once per underlying `MemoryItem` row (manual + derived layers).
     func asSnapshot() -> MemorySnapshot {
         var entries: [String] = []
-        if !profileSummary.isEmpty {
-            entries.append("Profile: \(profileSummary)")
-        }
-        if !styleTraits.isEmpty {
-            entries.append("Style traits: \(styleTraits.joined(separator: ", "))")
-        }
-        if !bannedPhrases.isEmpty {
-            entries.append("Avoid: \(bannedPhrases.joined(separator: ", "))")
-        }
-        if !backgroundFacts.isEmpty {
-            entries.append("Facts: \(backgroundFacts.joined(separator: ", "))")
-        }
-        if !replyHabits.isEmpty {
-            entries.append("Habits: \(replyHabits.joined(separator: ", "))")
-        }
+        let p = profileSummary
+        if !p.isEmpty { entries.append("Profile: \(p)") }
+        let styles = styleTraits
+        if !styles.isEmpty { entries.append("Style traits: \(styles.joined(separator: ", "))") }
+        let banned = bannedPhrases
+        if !banned.isEmpty { entries.append("Avoid: \(banned.joined(separator: ", "))") }
+        let facts = backgroundFacts
+        if !facts.isEmpty { entries.append("Facts: \(facts.joined(separator: ", "))") }
+        let habits = replyHabits
+        if !habits.isEmpty { entries.append("Habits: \(habits.joined(separator: ", "))") }
         return MemorySnapshot(title: "User Memory", entries: entries)
+    }
+
+    func asSnapshot(forPromptItems selection: [MemoryItem]) -> MemorySnapshot {
+        Self.snapshotFromItems(selection, title: "User Memory")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case items
+        case schemaVersion
+        case profileSummary
+        case styleTraits
+        case bannedPhrases
+        case backgroundFacts
+        case replyHabits
+    }
+
+    init(items: [MemoryItem]) {
+        self.items = items
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if c.contains(.items) {
+            items = try c.decode([MemoryItem].self, forKey: .items)
+            return
+        }
+        let profileSummary = try c.decodeIfPresent(String.self, forKey: .profileSummary) ?? ""
+        let styleTraits = try c.decodeIfPresent([String].self, forKey: .styleTraits) ?? []
+        let bannedPhrases = try c.decodeIfPresent([String].self, forKey: .bannedPhrases) ?? []
+        let backgroundFacts = try c.decodeIfPresent([String].self, forKey: .backgroundFacts) ?? []
+        let replyHabits = try c.decodeIfPresent([String].self, forKey: .replyHabits) ?? []
+        items = Self.migrateLegacyStrings(
+            profileSummary: profileSummary,
+            styleTraits: styleTraits,
+            bannedPhrases: bannedPhrases,
+            backgroundFacts: backgroundFacts,
+            replyHabits: replyHabits,
+            bucket: .manualUser,
+            openRouterMemoryKey: nil
+        )
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(2, forKey: .schemaVersion)
+        try c.encode(items, forKey: .items)
+    }
+
+    private static func migrateLegacyStrings(
+        profileSummary: String,
+        styleTraits: [String],
+        bannedPhrases: [String],
+        backgroundFacts: [String],
+        replyHabits: [String],
+        bucket: MemoryItemBucket,
+        openRouterMemoryKey: String?
+    ) -> [MemoryItem] {
+        let itemSource: MemorySyncSource = switch bucket {
+        case .manualUser: .manual
+        case .derivedUserOpenRouter: .openRouter
+        default: .heuristic
+        }
+        var out: [MemoryItem] = []
+        let now = Date.now
+        if !profileSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            out.append(
+                MemoryItem(
+                    bucket: bucket,
+                    scope: .user,
+                    memoryKey: openRouterMemoryKey,
+                    kind: .profileSummary,
+                    text: profileSummary,
+                    source: itemSource,
+                    createdAt: now,
+                    updatedAt: now
+                )
+            )
+        }
+        func appendLines(_ values: [String], kind: MemoryItemKind) {
+            for raw in values {
+                let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !t.isEmpty else { continue }
+                out.append(
+                    MemoryItem(
+                        bucket: bucket,
+                        scope: .user,
+                        memoryKey: openRouterMemoryKey,
+                        kind: kind,
+                        text: t,
+                        source: itemSource,
+                        createdAt: now,
+                        updatedAt: now
+                    )
+                )
+            }
+        }
+        appendLines(styleTraits, kind: .styleTrait)
+        appendLines(bannedPhrases, kind: .bannedPhrase)
+        appendLines(backgroundFacts, kind: .backgroundFact)
+        appendLines(replyHabits, kind: .replyHabit)
+        return out
+    }
+
+    static func itemsFromLegacyCodableFields(
+        profileSummary: String,
+        styleTraits: [String],
+        bannedPhrases: [String],
+        backgroundFacts: [String],
+        replyHabits: [String],
+        bucket: MemoryItemBucket,
+        openRouterMemoryKey: String?
+    ) -> [MemoryItem] {
+        migrateLegacyStrings(
+            profileSummary: profileSummary,
+            styleTraits: styleTraits,
+            bannedPhrases: bannedPhrases,
+            backgroundFacts: backgroundFacts,
+            replyHabits: replyHabits,
+            bucket: bucket,
+            openRouterMemoryKey: openRouterMemoryKey
+        )
+    }
+
+    static func snapshotFromItems(_ items: [MemoryItem], title: String) -> MemorySnapshot {
+        let active = MemoryItemVisibility.activeItems(items)
+        var entries: [String] = []
+        let profile = uniqueTextsForSnapshot(active, kind: .profileSummary).joined(separator: " ")
+        if !profile.isEmpty { entries.append("Profile: \(profile)") }
+        let styles = uniqueTextsForSnapshot(active, kind: .styleTrait)
+        if !styles.isEmpty { entries.append("Style traits: \(styles.joined(separator: ", "))") }
+        let banned = uniqueTextsForSnapshot(active, kind: .bannedPhrase)
+        if !banned.isEmpty { entries.append("Avoid: \(banned.joined(separator: ", "))") }
+        let facts = uniqueTextsForSnapshot(active, kind: .backgroundFact)
+        if !facts.isEmpty { entries.append("Facts: \(facts.joined(separator: ", "))") }
+        let habits = uniqueTextsForSnapshot(active, kind: .replyHabit)
+        if !habits.isEmpty { entries.append("Habits: \(habits.joined(separator: ", "))") }
+        let rel = uniqueTextsForSnapshot(active, kind: .relationshipSummary).joined(separator: " ")
+        if !rel.isEmpty { entries.append("Relationship: \(rel)") }
+        let prefs = uniqueTextsForSnapshot(active, kind: .preference)
+        if !prefs.isEmpty { entries.append("Preferences: \(prefs.joined(separator: ", "))") }
+        let topics = uniqueTextsForSnapshot(active, kind: .recurringTopic)
+        if !topics.isEmpty { entries.append("Topics: \(topics.joined(separator: ", "))") }
+        let bounds = uniqueTextsForSnapshot(active, kind: .boundary)
+        if !bounds.isEmpty { entries.append("Boundaries: \(bounds.joined(separator: ", "))") }
+        let noteLines = uniqueTextsForSnapshot(active, kind: .note)
+        if !noteLines.isEmpty { entries.append("Notes: \(noteLines.joined(separator: ", "))") }
+        return MemorySnapshot(title: title, entries: entries)
+    }
+
+    /// Dedupes by `normalizedKey` (manual bucket wins, then derived global, then OpenRouter slice) so prompt snippets are not repeated.
+    private static func snapshotBucketDisplayOrder(_ bucket: MemoryItemBucket) -> Int {
+        switch bucket {
+        case .manualUser, .manualContact: return 0
+        case .derivedUserGlobal, .derivedContact: return 1
+        case .derivedUserOpenRouter: return 2
+        }
+    }
+
+    private static func uniqueTextsForSnapshot(_ items: [MemoryItem], kind: MemoryItemKind) -> [String] {
+        let slice = items.filter { $0.kind == kind }
+        let sorted = slice.sorted { a, b in
+            let oa = snapshotBucketDisplayOrder(a.bucket)
+            let ob = snapshotBucketDisplayOrder(b.bucket)
+            if oa != ob { return oa < ob }
+            if a.updatedAt != b.updatedAt { return a.updatedAt > b.updatedAt }
+            return a.id.uuidString < b.id.uuidString
+        }
+        return dedupeNormalizedTexts(sorted)
+    }
+
+    private static func dedupeNormalizedTexts(_ rows: [MemoryItem]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for row in rows {
+            let key = row.normalizedKey.isEmpty ? MemoryNormalization.key(for: row.text) : row.normalizedKey
+            guard !key.isEmpty else {
+                if seen.insert(row.text).inserted { out.append(row.text) }
+                continue
+            }
+            guard seen.insert(key).inserted else { continue }
+            out.append(row.text)
+        }
+        return out
+    }
+
+    private mutating func replaceManualScalar(kind: MemoryItemKind, text: String, bucket: MemoryItemBucket) {
+        items.removeAll { $0.bucket == bucket && $0.kind == kind }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        items.append(MemoryItem(bucket: bucket, scope: .user, kind: kind, text: trimmed, source: .manual))
+    }
+
+    private mutating func replaceManualList(kind: MemoryItemKind, values: [String], bucket: MemoryItemBucket) {
+        items.removeAll { $0.bucket == bucket && $0.kind == kind }
+        for raw in values {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            items.append(MemoryItem(bucket: bucket, scope: .user, kind: kind, text: t, source: .manual))
+        }
+    }
+
+    private func mergedSingleLine(
+        kind: MemoryItemKind,
+        manualBucket: MemoryItemBucket,
+        derivedBuckets: [MemoryItemBucket]
+    ) -> String {
+        let rows = items.filter { !$0.suppressed && $0.kind == kind }
+        if let manual = rows.first(where: { $0.bucket == manualBucket })?.text, !manual.isEmpty {
+            return manual
+        }
+        let derived = rows.filter { derivedBuckets.contains($0.bucket) }
+        return derived.sorted { $0.updatedAt > $1.updatedAt }.first?.text ?? ""
+    }
+
+    private func mergedList(
+        kind: MemoryItemKind,
+        manualBucket: MemoryItemBucket,
+        derivedBuckets: [MemoryItemBucket]
+    ) -> [String] {
+        let rows = items.filter { !$0.suppressed && $0.kind == kind }
+        var order = [manualBucket]
+        order.append(contentsOf: derivedBuckets)
+        var out: [String] = []
+        var seen = Set<String>()
+        for bucket in order {
+            let slice = rows.filter { $0.bucket == bucket }.sorted { $0.updatedAt > $1.updatedAt }
+            for row in slice {
+                guard seen.insert(row.normalizedKey).inserted else { continue }
+                out.append(row.text)
+            }
+        }
+        return out
+    }
+
+    /// Engine use: target a specific storage bucket (avoid writing derived data into `manualUser` via property setters).
+    mutating func replaceBucketScalar(
+        kind: MemoryItemKind,
+        bucket: MemoryItemBucket,
+        memoryKey: String?,
+        text merged: String,
+        source: MemorySyncSource,
+        supersedesItemID: UUID? = nil
+    ) {
+        items.removeAll { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }
+        let t = merged.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        items.append(
+            MemoryItem(
+                bucket: bucket,
+                scope: .user,
+                memoryKey: memoryKey,
+                kind: kind,
+                text: t,
+                source: source,
+                supersedesItemID: supersedesItemID
+            )
+        )
+    }
+
+    mutating func replaceBucketList(
+        kind: MemoryItemKind,
+        bucket: MemoryItemBucket,
+        memoryKey: String?,
+        values: [String],
+        source: MemorySyncSource
+    ) {
+        items.removeAll { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }
+        for raw in values {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            items.append(
+                MemoryItem(
+                    bucket: bucket,
+                    scope: .user,
+                    memoryKey: memoryKey,
+                    kind: kind,
+                    text: t,
+                    source: source
+                )
+            )
+        }
+    }
+
+    func strings(kind: MemoryItemKind, bucket: MemoryItemBucket) -> [String] {
+        items.filter { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }.map(\.text)
+    }
+
+    func singleLine(kind: MemoryItemKind, bucket: MemoryItemBucket) -> String {
+        items.filter { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }.sorted { $0.updatedAt > $1.updatedAt }.first?.text ?? ""
     }
 }
 
 struct ContactMemory: Hashable, Codable, Sendable {
     let memoryKey: String
-    var relationshipSummary: String
-    var preferences: [String]
-    var recurringTopics: [String]
-    var boundaries: [String]
-    var notes: [String]
+    var items: [MemoryItem]
 
     static func empty(memoryKey: String) -> ContactMemory {
-        ContactMemory(memoryKey: memoryKey, relationshipSummary: "", preferences: [], recurringTopics: [], boundaries: [], notes: [])
+        ContactMemory(memoryKey: memoryKey, items: [])
+    }
+
+    init(
+        memoryKey: String,
+        relationshipSummary: String,
+        preferences: [String],
+        recurringTopics: [String],
+        boundaries: [String],
+        notes: [String]
+    ) {
+        self.memoryKey = memoryKey
+        items = Self.migrateLegacyContact(
+            memoryKey: memoryKey,
+            relationshipSummary: relationshipSummary,
+            preferences: preferences,
+            recurringTopics: recurringTopics,
+            boundaries: boundaries,
+            notes: notes
+        )
+    }
+
+    var relationshipSummary: String {
+        get {
+            mergedSingleLine(kind: .relationshipSummary, manualBucket: .manualContact, derivedBuckets: [.derivedContact])
+        }
+        set { replaceManualScalar(kind: .relationshipSummary, text: newValue, conversationID: nil) }
+    }
+
+    var preferences: [String] {
+        get {
+            mergedList(kind: .preference, manualBucket: .manualContact, derivedBuckets: [.derivedContact])
+        }
+        set { replaceManualList(kind: .preference, values: newValue, conversationID: nil) }
+    }
+
+    var recurringTopics: [String] {
+        get {
+            mergedList(kind: .recurringTopic, manualBucket: .manualContact, derivedBuckets: [.derivedContact])
+        }
+        set { replaceManualList(kind: .recurringTopic, values: newValue, conversationID: nil) }
+    }
+
+    var boundaries: [String] {
+        get {
+            mergedList(kind: .boundary, manualBucket: .manualContact, derivedBuckets: [.derivedContact])
+        }
+        set { replaceManualList(kind: .boundary, values: newValue, conversationID: nil) }
+    }
+
+    var notes: [String] {
+        get {
+            mergedList(kind: .note, manualBucket: .manualContact, derivedBuckets: [.derivedContact])
+        }
+        set { replaceManualList(kind: .note, values: newValue, conversationID: nil) }
     }
 
     func asSnapshot() -> MemorySnapshot {
         var entries: [String] = []
-        if !relationshipSummary.isEmpty {
-            entries.append("Relationship: \(relationshipSummary)")
-        }
-        if !preferences.isEmpty {
-            entries.append("Preferences: \(preferences.joined(separator: ", "))")
-        }
-        if !recurringTopics.isEmpty {
-            entries.append("Topics: \(recurringTopics.joined(separator: ", "))")
-        }
-        if !boundaries.isEmpty {
-            entries.append("Boundaries: \(boundaries.joined(separator: ", "))")
-        }
-        if !notes.isEmpty {
-            entries.append("Notes: \(notes.joined(separator: ", "))")
-        }
+        let rel = relationshipSummary
+        if !rel.isEmpty { entries.append("Relationship: \(rel)") }
+        let prefs = preferences
+        if !prefs.isEmpty { entries.append("Preferences: \(prefs.joined(separator: ", "))") }
+        let topics = recurringTopics
+        if !topics.isEmpty { entries.append("Topics: \(topics.joined(separator: ", "))") }
+        let bounds = boundaries
+        if !bounds.isEmpty { entries.append("Boundaries: \(bounds.joined(separator: ", "))") }
+        let noteLines = notes
+        if !noteLines.isEmpty { entries.append("Notes: \(noteLines.joined(separator: ", "))") }
         return MemorySnapshot(title: "Contact Memory", entries: entries)
+    }
+
+    func asSnapshot(forPromptItems selection: [MemoryItem]) -> MemorySnapshot {
+        Self.snapshotFromItems(selection, title: "Contact Memory")
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case memoryKey
+        case items
+        case schemaVersion
+        case relationshipSummary
+        case preferences
+        case recurringTopics
+        case boundaries
+        case notes
+    }
+
+    init(memoryKey: String, items: [MemoryItem]) {
+        self.memoryKey = memoryKey
+        self.items = items
+    }
+
+    init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        memoryKey = try c.decode(String.self, forKey: .memoryKey)
+        if c.contains(.items) {
+            items = try c.decode([MemoryItem].self, forKey: .items)
+            return
+        }
+        let relationshipSummary = try c.decodeIfPresent(String.self, forKey: .relationshipSummary) ?? ""
+        let preferences = try c.decodeIfPresent([String].self, forKey: .preferences) ?? []
+        let recurringTopics = try c.decodeIfPresent([String].self, forKey: .recurringTopics) ?? []
+        let boundaries = try c.decodeIfPresent([String].self, forKey: .boundaries) ?? []
+        let notes = try c.decodeIfPresent([String].self, forKey: .notes) ?? []
+        items = Self.migrateLegacyContact(memoryKey: memoryKey, relationshipSummary: relationshipSummary, preferences: preferences, recurringTopics: recurringTopics, boundaries: boundaries, notes: notes)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(memoryKey, forKey: .memoryKey)
+        try c.encode(2, forKey: .schemaVersion)
+        try c.encode(items, forKey: .items)
+    }
+
+    private static func migrateLegacyContact(
+        memoryKey: String,
+        relationshipSummary: String,
+        preferences: [String],
+        recurringTopics: [String],
+        boundaries: [String],
+        notes: [String]
+    ) -> [MemoryItem] {
+        var out: [MemoryItem] = []
+        let now = Date.now
+        if !relationshipSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            out.append(
+                MemoryItem(
+                    bucket: .manualContact,
+                    scope: .contact,
+                    memoryKey: memoryKey,
+                    kind: .relationshipSummary,
+                    text: relationshipSummary,
+                    source: .manual,
+                    createdAt: now,
+                    updatedAt: now
+                )
+            )
+        }
+        func append(_ values: [String], kind: MemoryItemKind) {
+            for raw in values {
+                let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !t.isEmpty else { continue }
+                out.append(
+                    MemoryItem(
+                        bucket: .manualContact,
+                        scope: .contact,
+                        memoryKey: memoryKey,
+                        kind: kind,
+                        text: t,
+                        source: .manual,
+                        createdAt: now,
+                        updatedAt: now
+                    )
+                )
+            }
+        }
+        append(preferences, kind: .preference)
+        append(recurringTopics, kind: .recurringTopic)
+        append(boundaries, kind: .boundary)
+        append(notes, kind: .note)
+        return out
+    }
+
+    private static func snapshotFromItems(_ items: [MemoryItem], title: String) -> MemorySnapshot {
+        UserProfileMemory.snapshotFromItems(items, title: title)
+    }
+
+    private mutating func replaceManualScalar(kind: MemoryItemKind, text: String, conversationID: String?) {
+        items.removeAll { $0.bucket == .manualContact && $0.kind == kind }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        items.append(
+            MemoryItem(
+                bucket: .manualContact,
+                scope: .contact,
+                memoryKey: memoryKey,
+                conversationID: conversationID,
+                kind: kind,
+                text: trimmed,
+                source: .manual
+            )
+        )
+    }
+
+    private mutating func replaceManualList(kind: MemoryItemKind, values: [String], conversationID: String?) {
+        items.removeAll { $0.bucket == .manualContact && $0.kind == kind }
+        for raw in values {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            items.append(
+                MemoryItem(
+                    bucket: .manualContact,
+                    scope: .contact,
+                    memoryKey: memoryKey,
+                    conversationID: conversationID,
+                    kind: kind,
+                    text: t,
+                    source: .manual
+                )
+            )
+        }
+    }
+
+    private func mergedSingleLine(kind: MemoryItemKind, manualBucket: MemoryItemBucket, derivedBuckets: [MemoryItemBucket]) -> String {
+        let rows = items.filter { !$0.suppressed && $0.kind == kind }
+        if let manual = rows.first(where: { $0.bucket == manualBucket })?.text, !manual.isEmpty {
+            return manual
+        }
+        let derived = rows.filter { derivedBuckets.contains($0.bucket) }
+        return derived.sorted { $0.updatedAt > $1.updatedAt }.first?.text ?? ""
+    }
+
+    private func mergedList(
+        kind: MemoryItemKind,
+        manualBucket: MemoryItemBucket,
+        derivedBuckets: [MemoryItemBucket]
+    ) -> [String] {
+        let rows = items.filter { !$0.suppressed && $0.kind == kind }
+        var order = [manualBucket]
+        order.append(contentsOf: derivedBuckets)
+        var out: [String] = []
+        var seen = Set<String>()
+        for bucket in order {
+            let slice = rows.filter { $0.bucket == bucket }.sorted { $0.updatedAt > $1.updatedAt }
+            for row in slice {
+                guard seen.insert(row.normalizedKey).inserted else { continue }
+                out.append(row.text)
+            }
+        }
+        return out
+    }
+
+    mutating func replaceBucketScalar(
+        kind: MemoryItemKind,
+        bucket: MemoryItemBucket,
+        text merged: String,
+        source: MemorySyncSource,
+        supersedesItemID: UUID? = nil
+    ) {
+        items.removeAll { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }
+        let t = merged.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        items.append(
+            MemoryItem(
+                bucket: bucket,
+                scope: .contact,
+                memoryKey: memoryKey,
+                kind: kind,
+                text: t,
+                source: source,
+                supersedesItemID: supersedesItemID
+            )
+        )
+    }
+
+    mutating func replaceBucketList(
+        kind: MemoryItemKind,
+        bucket: MemoryItemBucket,
+        values: [String],
+        source: MemorySyncSource
+    ) {
+        items.removeAll { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }
+        for raw in values {
+            let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { continue }
+            items.append(
+                MemoryItem(
+                    bucket: bucket,
+                    scope: .contact,
+                    memoryKey: memoryKey,
+                    kind: kind,
+                    text: t,
+                    source: source
+                )
+            )
+        }
+    }
+
+    func strings(kind: MemoryItemKind, bucket: MemoryItemBucket) -> [String] {
+        items.filter { $0.bucket == bucket && $0.kind == kind && !$0.suppressed }.map(\.text)
     }
 }
 
@@ -607,6 +1245,7 @@ struct ActivityLogEntry: Identifiable, Hashable, Codable, Sendable {
         case simulation
         case send
         case autonomy
+        case memory
         case error
     }
 
@@ -724,4 +1363,9 @@ struct SystemPrompt {
 
 extension Date {
     static let appleReferenceDate = Date(timeIntervalSinceReferenceDate: 0)
+}
+
+extension Notification.Name {
+    /// Posted when the user grants Contacts access so the app can refetch names from Messages data.
+    static let responderContactsAccessGranted = Notification.Name("com.ash.responder.contactsAccessGranted")
 }

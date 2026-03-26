@@ -39,6 +39,8 @@ final class AppModel {
     var isSending = false
     var isUpdatingMemory = false
     var memoryUpdateStatus: String?
+    /// Last non-fatal OpenRouter derivation failure from memory sync (heuristics may still have run).
+    var memorySyncLastError: String?
 
     private var hasStarted = false
     private var hasLoadedPersistentState = false
@@ -46,6 +48,7 @@ final class AppModel {
     private var monitorTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
     private var conversationLoadTask: Task<Void, Never>?
+    private var contactsAccessRefreshTask: Task<Void, Never>?
 
     init(container: AppContainer) {
         self.container = container
@@ -68,6 +71,14 @@ final class AppModel {
     func startIfNeeded() async {
         guard !hasStarted else { return }
         hasStarted = true
+
+        contactsAccessRefreshTask = Task { [weak self] in
+            for await _ in NotificationCenter.default.notifications(named: .responderContactsAccessGranted) {
+                guard let self else { return }
+                await self.handleContactsAccessGranted()
+            }
+        }
+
         isLoading = true
         defer { isLoading = false }
 
@@ -214,14 +225,19 @@ final class AppModel {
         guard !Task.isCancelled else { return }
         selectedConversationID = id
         conversationLaunchPreference.conversationID = id
+
         let conversation: ConversationRef
-        if let existingConversation = conversations.first(where: { $0.id == id }) {
-            conversation = existingConversation
-        } else if let fetchedConversation = try? await container.messagesStore.fetchConversation(id: id) {
-            conversations.removeAll { $0.id == fetchedConversation.id }
-            conversations.insert(fetchedConversation, at: 0)
-            conversation = fetchedConversation
-        } else {
+        do {
+            guard let resolved = try await hydratedConversation(for: id) else {
+                statusMessage = "Unable to load the selected conversation."
+                messages = []
+                return
+            }
+            conversation = resolved
+        } catch {
+            errorMessage = error.localizedDescription
+            statusMessage = "Could not read this conversation from Messages. Grant Full Disk Access, re-select the Messages folder in Settings if you use folder access, then try again."
+            messages = []
             return
         }
 
@@ -234,20 +250,15 @@ final class AppModel {
 
             let loadedMessages = try await fetchedMessages
             guard !Task.isCancelled, selectedConversationID == id else { return }
-            try await synchronizeMemoriesForUI(
-                conversation: conversation,
-                messages: loadedMessages,
-                status: "Updating memory for \(conversation.title)…"
-            )
             self.messages = loadedMessages
-            try await reloadUserMemoryState()
-            try await reloadContactMemoryState(for: conversation)
             summary = try await loadedSummary
             contactAutonomyConfig = try await loadedAutonomyConfig
             currentDraft = try await loadedDraft
+            try await synchronizeConversationMemoryState(for: conversation, messages: loadedMessages)
             statusMessage = "Loaded context for \(conversation.title)."
         } catch {
             errorMessage = error.localizedDescription
+            statusMessage = "Unable to fully load \(conversation.title)."
         }
     }
 
@@ -305,7 +316,7 @@ final class AppModel {
             summary = result.summarySnapshot
             userMemory = result.userMemory
             contactMemory = result.contactMemory
-            try await reloadUserMemoryState()
+            try await reloadUserMemoryState(scopedMemoryKey: result.conversation.memoryKey)
             try await reloadContactMemoryState(for: result.conversation)
             contactAutonomyConfig = try await container.database.loadAutonomyConfig(conversationID: result.conversation.id, memoryKey: result.conversation.memoryKey)
             statusMessage = "Draft ready."
@@ -370,7 +381,7 @@ final class AppModel {
     func saveUserMemory() async {
         do {
             try await container.memory.saveUserProfileMemory(manualUserMemory)
-            try await reloadUserMemoryState()
+            try await reloadUserMemoryState(scopedMemoryKey: selectedConversation?.memoryKey)
             statusMessage = "User memory saved."
         } catch {
             errorMessage = error.localizedDescription
@@ -405,9 +416,48 @@ final class AppModel {
                 messages: messages,
                 status: "Updating memory from recent chat context…"
             )
-            try await reloadUserMemoryState()
+            try await reloadUserMemoryState(scopedMemoryKey: conversation.memoryKey)
             try await reloadContactMemoryState(for: conversation)
             statusMessage = "Memory updated from conversation context."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func pinMemoryItem(id: UUID, pinned: Bool) async {
+        do {
+            try await container.memory.pinMemoryItem(id: id, pinned: pinned)
+            try await reloadUserMemoryState(scopedMemoryKey: selectedConversation?.memoryKey)
+            if let conversation = selectedConversation {
+                try await reloadContactMemoryState(for: conversation)
+            }
+            await refreshActivityLog()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func deleteMemoryItem(id: UUID) async {
+        do {
+            try await container.memory.deleteMemoryItem(id: id)
+            try await reloadUserMemoryState(scopedMemoryKey: selectedConversation?.memoryKey)
+            if let conversation = selectedConversation {
+                try await reloadContactMemoryState(for: conversation)
+            }
+            await refreshActivityLog()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func forgetMemoryItem(id: UUID) async {
+        do {
+            try await container.memory.forgetMemoryItem(id: id)
+            try await reloadUserMemoryState(scopedMemoryKey: selectedConversation?.memoryKey)
+            if let conversation = selectedConversation {
+                try await reloadContactMemoryState(for: conversation)
+            }
+            await refreshActivityLog()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -594,7 +644,7 @@ final class AppModel {
 
         do {
             try await container.memory.saveUserProfileMemory(manualUserMemory)
-            try await reloadUserMemoryState()
+            try await reloadUserMemoryState(scopedMemoryKey: selectedConversation?.memoryKey)
             statusMessage = "Voice profile saved locally."
         } catch {
             errorMessage = error.localizedDescription
@@ -741,7 +791,14 @@ final class AppModel {
             return persistedID
         }
 
-        guard let fetchedConversation = try? await container.messagesStore.fetchConversation(id: persistedID) else {
+        let fetchedConversation: ConversationRef?
+        do {
+            fetchedConversation = try await container.messagesStore.fetchConversation(id: persistedID)
+        } catch {
+            return nil
+        }
+
+        guard let fetchedConversation else {
             return nil
         }
 
@@ -794,7 +851,8 @@ final class AppModel {
     ) async throws {
         startMemoryUpdate(status: status)
         do {
-            try await container.memory.synchronizeMemories(conversation: conversation, messages: messages)
+            let outcome = try await container.memory.synchronizeMemories(conversation: conversation, messages: messages)
+            memorySyncLastError = outcome.lastOpenRouterDerivationError
             finishMemoryUpdate()
         } catch {
             finishMemoryUpdate()
@@ -802,16 +860,61 @@ final class AppModel {
         }
     }
 
-    private func reloadUserMemoryState() async throws {
-        async let loadedMerged = container.memory.loadUserProfileMemory()
+    private func synchronizeConversationMemoryState(
+        for conversation: ConversationRef,
+        messages: [ChatMessage]
+    ) async throws {
+        do {
+            try await synchronizeMemoriesForUI(
+                conversation: conversation,
+                messages: messages,
+                status: "Updating memory for \(conversation.title)…"
+            )
+        } catch {
+            try await reloadUserMemoryState(scopedMemoryKey: conversation.memoryKey)
+            try await reloadContactMemoryState(for: conversation)
+            throw error
+        }
+
+        try await reloadUserMemoryState(scopedMemoryKey: conversation.memoryKey)
+        try await reloadContactMemoryState(for: conversation)
+    }
+
+    private func hydratedConversation(for id: String) async throws -> ConversationRef? {
+        if let fetchedConversation = try await container.messagesStore.fetchConversation(id: id) {
+            upsertConversation(fetchedConversation)
+            return fetchedConversation
+        }
+
+        guard let existingConversation = conversations.first(where: { $0.id == id }) else {
+            return nil
+        }
+
+        upsertConversation(existingConversation)
+        return existingConversation
+    }
+
+    private func upsertConversation(_ conversation: ConversationRef) {
+        conversations.removeAll { $0.id == conversation.id }
+        conversations.insert(conversation, at: 0)
+    }
+
+    private func reloadUserMemoryState(scopedMemoryKey: String? = nil) async throws {
+        let loadedMerged: UserProfileMemory
+        if let scopedMemoryKey {
+            loadedMerged = try await container.memory.loadUserProfileMemoryForPrompt(memoryKey: scopedMemoryKey)
+        } else {
+            loadedMerged = try await container.memory.loadUserProfileMemory()
+        }
         async let loadedManual = container.database.loadUserProfileMemory()
         async let loadedDerived = container.database.loadDerivedUserProfileMemory()
         async let loadedMetadata = container.database.loadDerivedUserProfileMemoryMetadata()
 
-        userMemory = try await loadedMerged
+        userMemory = loadedMerged
         manualUserMemory = try await loadedManual
         derivedUserMemory = try await loadedDerived
         userMemoryMetadata = try await loadedMetadata
+        memorySyncLastError = userMemoryMetadata?.lastError
     }
 
     private func reloadContactMemoryState(for conversation: ConversationRef) async throws {
@@ -824,15 +927,24 @@ final class AppModel {
         manualContactMemory = try await loadedManual
         derivedContactMemory = try await loadedDerived
         contactMemoryMetadata = try await loadedMetadata
+        if let contactError = contactMemoryMetadata?.lastError {
+            memorySyncLastError = contactError
+        }
     }
 
     private func startMemoryUpdate(status: String) {
         isUpdatingMemory = true
         memoryUpdateStatus = status
+        memorySyncLastError = nil
     }
 
     private func finishMemoryUpdate() {
         isUpdatingMemory = false
         memoryUpdateStatus = nil
+    }
+
+    private func handleContactsAccessGranted() async {
+        await container.messagesStore.invalidateContactLabelCaches()
+        await refreshConversations()
     }
 }

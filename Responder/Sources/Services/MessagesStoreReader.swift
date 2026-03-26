@@ -1,6 +1,7 @@
 import Contacts
 import Foundation
 import GRDB
+import OSLog
 
 actor MessagesStoreReader: MessagesStoreProtocol {
     private let sourceDatabaseURL: URL
@@ -8,6 +9,7 @@ actor MessagesStoreReader: MessagesStoreProtocol {
     private let snapshotRootURL: URL
     private let fileManager: FileManager
     private let contactResolver = ContactNameResolver()
+    private let log = Logger(subsystem: Bundle.main.bundleIdentifier ?? "Responder", category: "MessagesStoreReader")
     private var cachedSnapshot: SnapshotContext?
     private var cachedSnapshotSignature: SnapshotSignature?
     private var cachedConversationLists: [Int: [ConversationRef]] = [:]
@@ -271,6 +273,12 @@ actor MessagesStoreReader: MessagesStoreProtocol {
         }
     }
 
+    func invalidateContactLabelCaches() {
+        cachedConversationLists.removeAll()
+        cachedConversationByID.removeAll()
+        cachedMessageLists.removeAll()
+    }
+
     func latestCursor(conversationID: String) async throws -> MonitorCursor? {
         try await withSnapshotQueue { dbQueue in
             try await dbQueue.read { db in
@@ -376,12 +384,12 @@ actor MessagesStoreReader: MessagesStoreProtocol {
         if let cachedSnapshot,
            let cachedSnapshotSignature,
            cachedSnapshotSignature == signature,
-           fileManager.fileExists(atPath: cachedSnapshot.directoryURL.path) {
+           cachedSnapshot.snapshotFilesAreValid(fileManager: fileManager) {
             return cachedSnapshot
         }
 
         if let cachedSnapshot {
-            Self.cleanupSnapshot(at: cachedSnapshot.directoryURL, fileManager: fileManager)
+            cachedSnapshot.cleanupDirectoryIfNeeded(fileManager: fileManager)
         }
         cachedConversationLists.removeAll()
         cachedConversationByID.removeAll()
@@ -390,8 +398,7 @@ actor MessagesStoreReader: MessagesStoreProtocol {
         let snapshot = try Self.makeSnapshotContext(
             sourceDatabaseURL: sourceDatabaseURL,
             securityScopedMessagesDirectoryURL: securityScopedMessagesDirectoryURL,
-            snapshotRootURL: snapshotRootURL,
-            fileManager: fileManager
+            log: log
         )
         cachedSnapshot = snapshot
         cachedSnapshotSignature = signature
@@ -424,8 +431,8 @@ actor MessagesStoreReader: MessagesStoreProtocol {
             fileManager: fileManager
         )
         guard currentSignature == cachedSnapshotSignature,
-              fileManager.fileExists(atPath: cachedSnapshot.directoryURL.path) else {
-            Self.cleanupSnapshot(at: cachedSnapshot.directoryURL, fileManager: fileManager)
+              cachedSnapshot.snapshotFilesAreValid(fileManager: fileManager) else {
+            cachedSnapshot.cleanupDirectoryIfNeeded(fileManager: fileManager)
             self.cachedSnapshot = nil
             self.cachedSnapshotSignature = nil
             cachedConversationLists.removeAll()
@@ -440,41 +447,28 @@ actor MessagesStoreReader: MessagesStoreProtocol {
     private static func makeSnapshotContext(
         sourceDatabaseURL: URL,
         securityScopedMessagesDirectoryURL: URL?,
-        snapshotRootURL: URL,
-        fileManager: FileManager
+        log: Logger
     ) throws -> SnapshotContext {
-        let directoryURL = snapshotRootURL.appending(path: UUID().uuidString, directoryHint: .isDirectory)
-        try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.readonly = true
+        configuration.label = "MessagesStoreReaderSnapshot"
 
-        let destinationDatabaseURL = directoryURL.appending(path: sourceDatabaseURL.lastPathComponent)
-
-        do {
-            try withMessagesDirectoryAccess(url: securityScopedMessagesDirectoryURL) {
-                try fileManager.copyItem(at: sourceDatabaseURL, to: destinationDatabaseURL)
-                try copyCompanionIfPresent(
-                    suffix: "-wal",
-                    sourceDatabaseURL: sourceDatabaseURL,
-                    directoryURL: directoryURL,
-                    fileManager: fileManager
-                )
-                try copyCompanionIfPresent(
-                    suffix: "-shm",
-                    sourceDatabaseURL: sourceDatabaseURL,
-                    directoryURL: directoryURL,
-                    fileManager: fileManager
-                )
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                let dbQueue: DatabaseQueue = try withMessagesDirectoryAccess(url: securityScopedMessagesDirectoryURL) {
+                    try DatabaseQueue.temporaryCopy(fromPath: sourceDatabaseURL.path, configuration: configuration)
+                }
+                return SnapshotContext(directoryURL: nil, dbQueue: dbQueue)
+            } catch {
+                lastError = error
+                log.error("Messages DB snapshot failed (attempt \(attempt + 1)/3): \(error.localizedDescription)")
+                if attempt < 2 {
+                    Thread.sleep(forTimeInterval: 0.2)
+                }
             }
-
-            var configuration = Configuration()
-            configuration.readonly = true
-            configuration.label = "MessagesStoreReaderSnapshot"
-
-            let dbQueue = try DatabaseQueue(path: destinationDatabaseURL.path, configuration: configuration)
-            return SnapshotContext(directoryURL: directoryURL, dbQueue: dbQueue)
-        } catch {
-            cleanupSnapshot(at: directoryURL, fileManager: fileManager)
-            throw error
         }
+        throw lastError ?? makeMessagesAccessError(detail: "Could not create a consistent copy of chat.db (SQLite backup failed).")
     }
 
     private static func makeSnapshotSignature(
@@ -547,19 +541,6 @@ actor MessagesStoreReader: MessagesStoreProtocol {
             code: 1,
             userInfo: [NSLocalizedDescriptionKey: message]
         )
-    }
-
-    private static func copyCompanionIfPresent(
-        suffix: String,
-        sourceDatabaseURL: URL,
-        directoryURL: URL,
-        fileManager: FileManager
-    ) throws {
-        let sourceURL = URL(fileURLWithPath: sourceDatabaseURL.path + suffix)
-        guard fileManager.fileExists(atPath: sourceURL.path) else { return }
-
-        let destinationURL = URL(fileURLWithPath: directoryURL.appending(path: sourceDatabaseURL.lastPathComponent).path + suffix)
-        try fileManager.copyItem(at: sourceURL, to: destinationURL)
     }
 
     private static func cleanupSnapshots(at snapshotRootURL: URL, fileManager: FileManager) {
@@ -738,8 +719,23 @@ private struct MessageRow: Sendable {
 }
 
 private struct SnapshotContext {
-    let directoryURL: URL
+    /// Present only for legacy on-disk file-copy snapshots; GRDB ``DatabaseQueue/temporaryCopy(fromPath:configuration:)`` snapshots omit this.
+    let directoryURL: URL?
     let dbQueue: DatabaseQueue
+
+    fileprivate func snapshotFilesAreValid(fileManager: FileManager) -> Bool {
+        guard let directoryURL else { return true }
+        return fileManager.fileExists(atPath: directoryURL.path)
+    }
+
+    fileprivate func cleanupDirectoryIfNeeded(fileManager: FileManager) {
+        guard let directoryURL else { return }
+        Self.cleanupSnapshot(at: directoryURL, fileManager: fileManager)
+    }
+
+    private static func cleanupSnapshot(at directoryURL: URL, fileManager: FileManager) {
+        try? fileManager.removeItem(at: directoryURL)
+    }
 }
 
 private struct SnapshotSignature: Equatable {
@@ -759,95 +755,165 @@ private struct MessageCacheKey: Hashable {
 }
 
 actor ContactNameResolver {
-    private let store = CNContactStore()
-    private var cache: [String: String?] = [:]
+    /// Empty string means a completed lookup with no matching display name (cache negative results).
+    private var cache: [String: String] = [:]
     private var accessAttempted = false
     private var canAccessContacts = false
+    private var permissionRequestTask: Task<Void, Never>?
 
     func displayName(for rawHandle: String) async -> String? {
-        let key = normalize(handle: rawHandle)
+        let key = Self.normalize(handle: rawHandle)
         if let cached = cache[key] {
-            return cached
+            return cached.isEmpty ? nil : cached
         }
 
-        await ensureAccess()
+        await refreshAccessStatus()
         guard canAccessContacts else {
-            cache[key] = nil
+            requestAccessIfNeeded()
             return nil
         }
 
-        let name = lookupContactName(for: key)
-        cache[key] = name
+        let name = await lookupContactNameOnMainActor(normalizedHandle: key)
+        cache[key] = name ?? ""
         return name
     }
 
-    private func ensureAccess() async {
-        guard !accessAttempted else { return }
-        accessAttempted = true
-
+    private func refreshAccessStatus() async {
         let status = CNContactStore.authorizationStatus(for: .contacts)
         switch status {
         case .authorized, .limited:
+            accessAttempted = true
             canAccessContacts = true
         case .notDetermined:
-            canAccessContacts = (try? await store.requestAccess(for: .contacts)) ?? false
+            canAccessContacts = false
         case .denied, .restricted:
+            accessAttempted = true
             canAccessContacts = false
         @unknown default:
+            accessAttempted = true
             canAccessContacts = false
         }
     }
 
-    private func lookupContactName(for normalizedHandle: String) -> String? {
-        let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactNicknameKey] as [CNKeyDescriptor]
+    private func requestAccessIfNeeded() {
+        guard !accessAttempted else { return }
+        guard permissionRequestTask == nil else { return }
+        guard CNContactStore.authorizationStatus(for: .contacts) == .notDetermined else { return }
 
-        if normalizedHandle.contains("@"),
-           let contact = try? store.unifiedContacts(
-                matching: CNContact.predicateForContacts(matchingEmailAddress: normalizedHandle),
-                keysToFetch: keys
-           ).first,
-           let name = formattedName(from: contact) {
-            return name
+        accessAttempted = true
+        permissionRequestTask = Task {
+            let granted = await Task { @MainActor in
+                let store = CNContactStore()
+                return (try? await store.requestAccess(for: .contacts)) ?? false
+            }.value
+            await self.completePermissionRequest(granted: granted)
         }
+    }
 
-        let phoneVariants = phoneLookupVariants(for: normalizedHandle)
-        for variant in phoneVariants {
-            let predicate = CNContact.predicateForContacts(matching: CNPhoneNumber(stringValue: variant))
-            if let contact = try? store.unifiedContacts(matching: predicate, keysToFetch: keys).first,
-               let name = formattedName(from: contact) {
-                return name
+    private func completePermissionRequest(granted: Bool) async {
+        canAccessContacts = granted
+        permissionRequestTask = nil
+        if granted {
+            cache.removeAll()
+            NotificationCenter.default.post(name: .responderContactsAccessGranted, object: nil)
+        }
+    }
+
+    @MainActor
+    private static func contactLookupKeys() -> [CNKeyDescriptor] {
+        [
+            CNContactGivenNameKey as CNKeyDescriptor,
+            CNContactFamilyNameKey as CNKeyDescriptor,
+            CNContactMiddleNameKey as CNKeyDescriptor,
+            CNContactNamePrefixKey as CNKeyDescriptor,
+            CNContactNameSuffixKey as CNKeyDescriptor,
+            CNContactNicknameKey as CNKeyDescriptor,
+            CNContactDepartmentNameKey as CNKeyDescriptor,
+            CNContactOrganizationNameKey as CNKeyDescriptor,
+        ]
+    }
+
+    private func lookupContactNameOnMainActor(normalizedHandle: String) async -> String? {
+        await MainActor.run {
+            let store = CNContactStore()
+            let keys = Self.contactLookupKeys()
+
+            if normalizedHandle.contains("@") {
+                let predicate = CNContact.predicateForContacts(matchingEmailAddress: normalizedHandle)
+                if let contact = try? store.unifiedContacts(matching: predicate, keysToFetch: keys).first {
+                    return Self.formattedName(from: contact)
+                }
             }
+
+            let phoneVariants = Self.phoneLookupVariants(for: normalizedHandle)
+            for variant in phoneVariants {
+                let predicate = CNContact.predicateForContacts(matching: CNPhoneNumber(stringValue: variant))
+                if let contact = try? store.unifiedContacts(matching: predicate, keysToFetch: keys).first {
+                    return Self.formattedName(from: contact)
+                }
+            }
+
+            return nil
+        }
+    }
+
+    private static func formattedName(from contact: CNContact) -> String? {
+        // Avoid `CNContactFormatter` + `.fullName` here: on some unified contacts it calls into
+        // `-[CNContact displayNameOrder]` and can raise an Objective‑C exception (crashing the app).
+        // Assemble from the keys we fetch instead.
+        var segments: [String] = []
+        for piece in [
+            contact.namePrefix,
+            contact.givenName,
+            contact.middleName,
+            contact.familyName,
+            contact.nameSuffix
+        ] {
+            let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { segments.append(trimmed) }
+        }
+        if !segments.isEmpty {
+            return segments.joined(separator: " ")
         }
 
-        return nil
-    }
-
-    private func formattedName(from contact: CNContact) -> String? {
-        let given = contact.givenName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let family = contact.familyName.trimmingCharacters(in: .whitespacesAndNewlines)
         let nickname = contact.nickname.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let fullName = [given, family].filter { !$0.isEmpty }.joined(separator: " ")
-        if !fullName.isEmpty { return fullName }
         if !nickname.isEmpty { return nickname }
+
+        let department = contact.departmentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !department.isEmpty { return department }
+
+        let org = contact.organizationName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !org.isEmpty { return org }
+
         return nil
     }
 
-    private func phoneLookupVariants(for normalizedHandle: String) -> [String] {
+    private static func phoneLookupVariants(for normalizedHandle: String) -> [String] {
         let digits = normalizedHandle.filter(\.isNumber)
-        guard !digits.isEmpty else { return [normalizedHandle] }
+        guard !digits.isEmpty else { return dedupe([normalizedHandle]) }
 
         var variants = [normalizedHandle, digits]
+        if normalizedHandle.hasPrefix("+") {
+            variants.append(String(normalizedHandle.dropFirst()))
+        }
         if let lastTen = digits.suffixIfLonger(than: 10) {
             variants.append(String(lastTen))
         }
-        return Array(NSOrderedSet(array: variants)) as? [String] ?? variants
+        if let last11 = digits.suffixIfLonger(than: 11) {
+            variants.append(String(last11))
+        }
+        return dedupe(variants)
     }
 
-    private func normalize(handle: String) -> String {
-        handle
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+    private static func dedupe(_ variants: [String]) -> [String] {
+        Array(NSOrderedSet(array: variants)) as? [String] ?? variants
+    }
+
+    private static func normalize(handle: String) -> String {
+        var h = handle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if h.hasPrefix("tel:") { h.removeFirst(4) }
+        if h.hasPrefix("sms:") { h.removeFirst(4) }
+        return h.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

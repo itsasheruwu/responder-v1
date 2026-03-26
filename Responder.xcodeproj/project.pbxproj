@@ -26,12 +26,15 @@
 		98CE66D2E6E90D21EFB22E00 /* ResponderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4676272CE7029B590570AD0 /* ResponderApp.swift */; };
 		B4EE40B2F4FAE0B0AEF62FCC /* ResponderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1E0475A5F2F14AF06DAA096 /* ResponderTests.swift */; };
 		B5B2D68DD4D85170D8DDF1CD /* DomainModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5FECE13CFC19ECE5DF9DA07 /* DomainModels.swift */; };
+		F901A1B12FCD4601B2C3D4EA /* MemoryItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = F901A1B02FCD4601B2C3D4EA /* MemoryItem.swift */; };
 		BF4C0DE46AE3B64202A76F89 /* MemoryInspectorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E1E9776B6D28463A36A77F3 /* MemoryInspectorView.swift */; };
 		C21838FFF4C7047E8A12FAC3 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6DF98F677CA6A3730A54912 /* AppModel.swift */; };
 		DBE68B2C3DD4DE4780FBB1A0 /* AppContainer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08AC1930F179989FD7BD7751 /* AppContainer.swift */; };
 		E73FCE4A185C4F02383E28D8 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04D98917EF7DCAAD92C5C252 /* SettingsView.swift */; };
 		E778AE515196869662D2273F /* MemoryEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CF78FE779CF650FFA4D3050 /* MemoryEngine.swift */; };
+		E901A1B12FCD4601B2C3D4E5 /* MemoryTranscriptWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E901A1B02FCD4601B2C3D4E5 /* MemoryTranscriptWindow.swift */; };
 		EF8FFA2FE866DAEEE9767C6A /* AppDatabase.swift in Sources */ = {isa = PBXBuildFile; fileRef = 993D84EA5CCB7DCBF1284D10 /* AppDatabase.swift */; };
+		A1B2C3D45E6F7089012ABCDE /* AppSettingsJSONStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D45E6F7089012ABCDF /* AppSettingsJSONStore.swift */; };
 		F908FED1C99C41DB88E303CF /* ContextManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F47B1E9937941B5A2DBCAAA /* ContextManager.swift */; };
 		F985FE3B27875AC82E2ACBBB /* PermissionGateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F304213FE4F167323D35C07C /* PermissionGateView.swift */; };
 /* End PBXBuildFile section */
@@ -63,6 +66,7 @@
 		1FA8EA705EB2DB83DBCAB6B5 /* ResponderTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ResponderTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3940D402B2EB3378F1307380 /* OpenRouterClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenRouterClient.swift; sourceTree = "<group>"; };
 		3CF78FE779CF650FFA4D3050 /* MemoryEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryEngine.swift; sourceTree = "<group>"; };
+		E901A1B02FCD4601B2C3D4E5 /* MemoryTranscriptWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryTranscriptWindow.swift; sourceTree = "<group>"; };
 		473B6FF4EF8B39C58FDCD85D /* MessagesDirectoryAccessStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesDirectoryAccessStore.swift; sourceTree = "<group>"; };
 		517F8656D404C03D86DA8568 /* ResponderUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ResponderUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		7DDA6425BC2391081619C823 /* ActivityLogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityLogView.swift; sourceTree = "<group>"; };
@@ -71,6 +75,7 @@
 		91E3D321598AD9D71430CC04 /* Responder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Responder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		920C3319A63E2FF0E3F348F1 /* AutonomyEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AutonomyEngine.swift; sourceTree = "<group>"; };
 		993D84EA5CCB7DCBF1284D10 /* AppDatabase.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDatabase.swift; sourceTree = "<group>"; };
+		A1B2C3D45E6F7089012ABCDF /* AppSettingsJSONStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettingsJSONStore.swift; sourceTree = "<group>"; };
 		A4676272CE7029B590570AD0 /* ResponderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponderApp.swift; sourceTree = "<group>"; };
 		A67911A2CAAC144CEA293852 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		AC58B9CEF34AD7547D354FA2 /* OllamaClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OllamaClient.swift; sourceTree = "<group>"; };
@@ -79,6 +84,7 @@
 		C04BEB6F29FD8EC23E3C9D1A /* MessagesStoreReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MessagesStoreReader.swift; sourceTree = "<group>"; };
 		D4147C9C88C1C8A54EE64D45 /* RoutingLLMClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RoutingLLMClient.swift; sourceTree = "<group>"; };
 		D5FECE13CFC19ECE5DF9DA07 /* DomainModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainModels.swift; sourceTree = "<group>"; };
+		F901A1B02FCD4601B2C3D4EA /* MemoryItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoryItem.swift; sourceTree = "<group>"; };
 		E1E0475A5F2F14AF06DAA096 /* ResponderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResponderTests.swift; sourceTree = "<group>"; };
 		F304213FE4F167323D35C07C /* PermissionGateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionGateView.swift; sourceTree = "<group>"; };
 		F474D6ADE26ABF5FB83AAFA5 /* Summarizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Summarizer.swift; sourceTree = "<group>"; };
@@ -108,6 +114,7 @@
 			isa = PBXGroup;
 			children = (
 				993D84EA5CCB7DCBF1284D10 /* AppDatabase.swift */,
+				A1B2C3D45E6F7089012ABCDF /* AppSettingsJSONStore.swift */,
 			);
 			path = Persistence;
 			sourceTree = "<group>";
@@ -130,6 +137,7 @@
 			isa = PBXGroup;
 			children = (
 				D5FECE13CFC19ECE5DF9DA07 /* DomainModels.swift */,
+				F901A1B02FCD4601B2C3D4EA /* MemoryItem.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -171,6 +179,7 @@
 				920C3319A63E2FF0E3F348F1 /* AutonomyEngine.swift */,
 				7F47B1E9937941B5A2DBCAAA /* ContextManager.swift */,
 				3CF78FE779CF650FFA4D3050 /* MemoryEngine.swift */,
+				E901A1B02FCD4601B2C3D4E5 /* MemoryTranscriptWindow.swift */,
 				473B6FF4EF8B39C58FDCD85D /* MessagesDirectoryAccessStore.swift */,
 				908F1A994034212257A7F8F2 /* MessagesSender.swift */,
 				C04BEB6F29FD8EC23E3C9D1A /* MessagesStoreReader.swift */,
@@ -336,11 +345,14 @@
 				522DB90EC86F97697BC1EB8C /* ActivityLogView.swift in Sources */,
 				DBE68B2C3DD4DE4780FBB1A0 /* AppContainer.swift in Sources */,
 				EF8FFA2FE866DAEEE9767C6A /* AppDatabase.swift in Sources */,
+				A1B2C3D45E6F7089012ABCDE /* AppSettingsJSONStore.swift in Sources */,
 				C21838FFF4C7047E8A12FAC3 /* AppModel.swift in Sources */,
 				8657DB84EE2FE07C94F9C434 /* AutonomyEngine.swift in Sources */,
 				F908FED1C99C41DB88E303CF /* ContextManager.swift in Sources */,
 				B5B2D68DD4D85170D8DDF1CD /* DomainModels.swift in Sources */,
+				F901A1B12FCD4601B2C3D4EA /* MemoryItem.swift in Sources */,
 				E778AE515196869662D2273F /* MemoryEngine.swift in Sources */,
+				E901A1B12FCD4601B2C3D4E5 /* MemoryTranscriptWindow.swift in Sources */,
 				BF4C0DE46AE3B64202A76F89 /* MemoryInspectorView.swift in Sources */,
 				1A986A05B0C07816446CF817 /* MessagesDirectoryAccessStore.swift in Sources */,
 				41AD7CD3933400D8F7B2DE35 /* MessagesSender.swift in Sources */,

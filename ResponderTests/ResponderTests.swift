@@ -2,7 +2,152 @@ import XCTest
 @testable import Responder
 
 final class ResponderTests: XCTestCase {
-    func testContextManagerPreservesPromptLayerOrder() throws {
+    func testLegacyUserProfileMemoryJSONDecodesIntoItems() throws {
+        let legacy = Data(
+            """
+            {"profileSummary":"Voice A","styleTraits":["brief"],"bannedPhrases":[],"backgroundFacts":[],"replyHabits":[]}
+            """.utf8
+        )
+        let decoded = try JSONDecoder().decode(UserProfileMemory.self, from: legacy)
+        XCTAssertFalse(decoded.items.isEmpty)
+        XCTAssertEqual(decoded.profileSummary, "Voice A")
+        XCTAssertTrue(decoded.styleTraits.contains("brief"))
+    }
+
+    func testMemoryItemSupersessionHidesReplacedFact() {
+        let oldID = UUID()
+        let old = MemoryItem(
+            id: oldID,
+            bucket: .derivedContact,
+            scope: .contact,
+            memoryKey: "k",
+            kind: .note,
+            text: "Lives in Boston",
+            source: .heuristic
+        )
+        let new = MemoryItem(
+            bucket: .derivedContact,
+            scope: .contact,
+            memoryKey: "k",
+            kind: .note,
+            text: "Moved to London",
+            source: .openRouter,
+            supersedesItemID: oldID
+        )
+        let visible = MemoryItemVisibility.activeItems([old, new])
+        XCTAssertEqual(visible.map(\.id), [new.id])
+    }
+
+    func testMemoryItemDeduperCollapsesIdenticalRows() {
+        let base = MemoryItem(
+            bucket: .derivedUserGlobal,
+            scope: .user,
+            kind: .styleTrait,
+            text: "brief replies",
+            source: .heuristic,
+            updatedAt: Date(timeIntervalSince1970: 100)
+        )
+        let duplicate = MemoryItem(
+            bucket: .derivedUserGlobal,
+            scope: .user,
+            kind: .styleTrait,
+            text: "brief replies",
+            source: .openRouter,
+            updatedAt: Date(timeIntervalSince1970: 200)
+        )
+        let other = MemoryItem(
+            bucket: .derivedUserGlobal,
+            scope: .user,
+            kind: .styleTrait,
+            text: "uses lowercase",
+            source: .heuristic
+        )
+        let out = MemoryItemDeduper.deduplicate([base, duplicate, other])
+        XCTAssertEqual(out.count, 2)
+        XCTAssertTrue(out.contains { $0.text == "uses lowercase" })
+        let brief = out.filter { $0.text == "brief replies" }
+        XCTAssertEqual(brief.count, 1)
+        XCTAssertEqual(brief.first?.updatedAt, duplicate.updatedAt)
+    }
+
+    func testSuppressedNormalizedKeysReturnedFromDatabase() async throws {
+        let database = try AppDatabase(inMemory: true)
+        let key = MemoryNormalization.key(for: "Do not re-add this")
+        let tombstone = MemoryItem(
+            bucket: .derivedContact,
+            scope: .contact,
+            memoryKey: "alex@example.com",
+            kind: .note,
+            text: "Do not re-add this",
+            source: .heuristic,
+            suppressed: true,
+            normalizedKeyOverride: key
+        )
+        let contact = ContactMemory(memoryKey: "alex@example.com", items: [tombstone])
+        try await database.saveDerivedContactMemory(contact)
+        let suppressed = try await database.suppressedNormalizedKeys(scope: .contact, memoryKey: "alex@example.com")
+        XCTAssertTrue(suppressed.contains(key))
+    }
+
+    func testMemoryPromptAssemblyPrefersManualAndPinnedWithinBudget() async throws {
+        let manual = MemoryItem(
+            bucket: .manualUser,
+            scope: .user,
+            kind: .backgroundFact,
+            text: "Manual fact about meetings",
+            source: .manual
+        )
+        let pinned = MemoryItem(
+            bucket: .derivedUserGlobal,
+            scope: .user,
+            kind: .backgroundFact,
+            text: "zebra migration patterns",
+            source: .heuristic,
+            pinned: true
+        )
+        let noise = MemoryItem(
+            bucket: .derivedUserGlobal,
+            scope: .user,
+            kind: .backgroundFact,
+            text: "unrelated astronomy trivia",
+            source: .heuristic
+        )
+        let conversation = ChatMessage(
+            id: "1",
+            text: "zebra and migration",
+            senderName: "Alex",
+            senderHandle: nil,
+            date: .now,
+            direction: .incoming,
+            containsAttachmentPlaceholder: false,
+            isUnsupportedContent: false
+        )
+        let picked = try await MemoryPromptAssembly.selectPromptItems(
+            mergedItems: [noise, manual, pinned],
+            manualBuckets: [.manualUser],
+            recentMessages: [conversation],
+            maxCount: 2,
+            retriever: KeywordOverlapMemoryRetriever()
+        )
+        XCTAssertEqual(picked.count, 2)
+        XCTAssertTrue(picked.contains { $0.text == manual.text })
+        XCTAssertTrue(picked.contains { $0.text == pinned.text })
+    }
+
+    func testMemoryTranscriptWindowOrdersChronologically() {
+        let d0 = Date(timeIntervalSince1970: 1000)
+        let d1 = Date(timeIntervalSince1970: 2000)
+        let d2 = Date(timeIntervalSince1970: 3000)
+        let messages = [
+            ChatMessage(id: "o1", text: "last", senderName: "Me", senderHandle: nil, date: d2, direction: .outgoing, containsAttachmentPlaceholder: false, isUnsupportedContent: false),
+            ChatMessage(id: "i1", text: "first", senderName: "Alex", senderHandle: "a@b.com", date: d0, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false),
+            ChatMessage(id: "i2", text: "mid", senderName: "Alex", senderHandle: "a@b.com", date: d1, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+        ]
+        let windowed = MemoryTranscriptWindow.recentMessagesForDerivation(messages, maxCount: 10, maxAge: nil)
+        XCTAssertEqual(windowed.map(\.id), ["i1", "i2", "o1"])
+    }
+
+    func testContextManagerPreservesPromptLayerOrder() async throws {
         let manager = ContextManager()
         let conversation = ConversationRef(
             id: "c1",
@@ -14,7 +159,7 @@ final class ResponderTests: XCTestCase {
             lastMessageDate: .now,
             unreadCount: 0
         )
-        let packet = try manager.buildPrompt(
+        let packet = try await manager.buildPrompt(
             modelName: "local-model",
             conversation: conversation,
             messages: [
@@ -23,13 +168,14 @@ final class ResponderTests: XCTestCase {
             userMemory: UserProfileMemory(profileSummary: "Dry and concise", styleTraits: ["short"], bannedPhrases: [], backgroundFacts: [], replyHabits: []),
             contactMemory: .empty(memoryKey: "alex@example.com"),
             summary: .empty(conversationID: "c1"),
-            contextLimit: 4096
+            contextLimit: 4096,
+            providerConfiguration: .default
         )
 
         XCTAssertEqual(packet.layers.map(\.id), ["user-memory", "contact-memory", "rolling-summary", "conversation-context", "recent-messages"])
     }
 
-    func testContextManagerCompactsRecentMessagesBeforeExceedingLimit() throws {
+    func testContextManagerCompactsRecentMessagesBeforeExceedingLimit() async throws {
         let manager = ContextManager()
         let conversation = ConversationRef(
             id: "c1",
@@ -46,18 +192,85 @@ final class ResponderTests: XCTestCase {
             ChatMessage(id: "\($0)", text: String(repeating: "word ", count: 40), senderName: $0.isMultiple(of: 2) ? "Alex" : "Me", senderHandle: "alex@example.com", date: .now.addingTimeInterval(TimeInterval($0)), direction: $0.isMultiple(of: 2) ? .incoming : .outgoing, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
         }
 
-        let packet = try manager.buildPrompt(
+        let packet = try await manager.buildPrompt(
             modelName: "local-model",
             conversation: conversation,
             messages: messages,
             userMemory: .empty,
             contactMemory: .empty(memoryKey: "alex@example.com"),
             summary: .empty(conversationID: "c1"),
-            contextLimit: 1200
+            contextLimit: 1200,
+            providerConfiguration: .default
         )
 
         XCTAssertTrue(packet.contextUsage.compacted)
         XCTAssertLessThanOrEqual(packet.contextUsage.estimatedInputTokens + packet.contextUsage.reservedOutputTokens + packet.contextUsage.reservedHeadroomTokens, 1200)
+    }
+
+    func testContextManagerFallsBackWhenEmbeddingResponseInvalid() async throws {
+        let urlConfiguration = URLSessionConfiguration.ephemeral
+        urlConfiguration.protocolClasses = [MockOpenRouterURLProtocol.self]
+        let session = URLSession(configuration: urlConfiguration)
+        MockOpenRouterURLProtocol.reset(responseStatusCode: 200, responseBody: "{\"choices\":[]}")
+        let manager = ContextManager(openRouter: OpenRouterClient(session: session))
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+        let userMemory = UserProfileMemory(items: [
+            MemoryItem(bucket: .derivedUserGlobal, scope: .user, kind: .backgroundFact, text: "zebra migration habits", source: .heuristic),
+            MemoryItem(bucket: .derivedUserGlobal, scope: .user, kind: .backgroundFact, text: "unrelated astronomy trivia", source: .heuristic)
+        ])
+        let providerConfiguration = ProviderConfiguration(
+            selectedProvider: .openRouter,
+            openRouterAPIKey: "test-key",
+            openRouterBaseURL: "https://example.com/api/v1",
+            useEmbeddingMemoryRetrieval: true,
+            memoryEmbeddingModel: "test/embed-model"
+        )
+        let packet = try await manager.buildPrompt(
+            modelName: "local-model",
+            conversation: conversation,
+            messages: [
+                ChatMessage(id: "m1", text: "Tell me about zebras", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+            ],
+            userMemory: userMemory,
+            contactMemory: .empty(memoryKey: "alex@example.com"),
+            summary: .empty(conversationID: "c1"),
+            contextLimit: 4096,
+            providerConfiguration: providerConfiguration
+        )
+        let userLayer = packet.layers.first { $0.id == "user-memory" }
+        XCTAssertNotNil(userLayer)
+        XCTAssertTrue(userLayer?.content.contains("zebra migration") ?? false)
+    }
+
+    func testDerivedContactMemoryTrimsUnpinnedRows() async throws {
+        let database = try AppDatabase(inMemory: true)
+        var items: [MemoryItem] = []
+        for i in 0..<420 {
+            items.append(
+                MemoryItem(
+                    bucket: .derivedContact,
+                    scope: .contact,
+                    memoryKey: "alex@example.com",
+                    kind: .note,
+                    text: "Derived note slot \(i)",
+                    source: .heuristic,
+                    createdAt: Date(timeIntervalSince1970: TimeInterval(i)),
+                    updatedAt: Date(timeIntervalSince1970: TimeInterval(i))
+                )
+            )
+        }
+        try await database.saveDerivedContactMemory(ContactMemory(memoryKey: "alex@example.com", items: items))
+        let count = try await database.countUnpinnedUnsuppressedMemoryItems(bucket: .derivedContact, scope: .contact, memoryKey: "alex@example.com")
+        XCTAssertEqual(count, MemoryStorageLimits.maxDerivedRowsContact)
     }
 
     func testMemoryEngineMergesCandidatesUniquely() async throws {
@@ -386,9 +599,11 @@ final class ResponderTests: XCTestCase {
         ]
 
         try await memory.synchronizeMemories(conversation: conversation, messages: messages)
-        let updatedUser = try await memory.loadUserProfileMemory()
+        let updatedUser = try await memory.loadUserProfileMemoryForPrompt(memoryKey: conversation.memoryKey)
         let updated = try await memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
+        let openRouterSlice = try await database.loadDerivedUserOpenRouterSlice(memoryKey: conversation.memoryKey)
 
+        XCTAssertEqual(openRouterSlice?.profileSummary, "You write concise, direct replies and usually stay focused on logistics.")
         XCTAssertEqual(updatedUser.profileSummary, "You write concise, direct replies and usually stay focused on logistics.")
         XCTAssertTrue(updatedUser.styleTraits.contains("brief"))
         XCTAssertTrue(updatedUser.backgroundFacts.contains("You often coordinate deliverables and timelines."))
@@ -468,13 +683,15 @@ final class ResponderTests: XCTestCase {
         let storedManualContact = try await database.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
         let storedDerivedUser = try await database.loadDerivedUserProfileMemory()
         let storedDerivedContact = try await database.loadDerivedContactMemory(memoryKey: conversation.memoryKey)
-        let mergedUser = try await memory.loadUserProfileMemory()
+        let openRouterSlice = try await database.loadDerivedUserOpenRouterSlice(memoryKey: conversation.memoryKey)
+        let mergedUser = try await memory.loadUserProfileMemoryForPrompt(memoryKey: conversation.memoryKey)
         let mergedContact = try await memory.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
 
         XCTAssertEqual(storedManualUser.profileSummary, "Manual voice summary")
         XCTAssertEqual(storedManualContact.relationshipSummary, "Manual relationship note")
-        XCTAssertEqual(storedDerivedUser.profileSummary, "Derived voice summary")
-        XCTAssertEqual(storedDerivedContact.relationshipSummary, "Derived relationship summary")
+        XCTAssertEqual(openRouterSlice?.profileSummary, "Derived voice summary.")
+        XCTAssertTrue(storedDerivedUser.profileSummary.isEmpty)
+        XCTAssertEqual(storedDerivedContact.relationshipSummary, "Derived relationship summary.")
         XCTAssertEqual(mergedUser.profileSummary, "Manual voice summary")
         XCTAssertEqual(mergedContact.relationshipSummary, "Manual relationship note")
         XCTAssertTrue(mergedUser.styleTraits.contains("warm"))
@@ -588,6 +805,52 @@ final class ResponderTests: XCTestCase {
         XCTAssertEqual(contactMetadata?.source, .openRouter)
         XCTAssertNotNil(userMetadata?.syncedAt)
         XCTAssertNotNil(contactMetadata?.syncedAt)
+    }
+
+    func testMemoryEngineRecordsOpenRouterDerivationErrorInMetadata() async throws {
+        let database = try AppDatabase(inMemory: true)
+        try await database.saveProviderConfiguration(
+            ProviderConfiguration(
+                selectedProvider: .ollama,
+                openRouterAPIKey: "test-key",
+                openRouterBaseURL: "https://example.com/api/v1"
+            )
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MockOpenRouterURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        MockOpenRouterURLProtocol.reset(responseStatusCode: 500, responseBody: "{}")
+
+        let memory = MemoryEngine(
+            database: database,
+            openRouterClient: OpenRouterClient(session: session)
+        )
+        let conversation = ConversationRef(
+            id: "c1",
+            title: "Alex",
+            service: .iMessage,
+            participants: [Participant(handle: "alex@example.com", displayName: "Alex", service: .iMessage)],
+            isGroup: false,
+            lastMessagePreview: "",
+            lastMessageDate: .now,
+            unreadCount: 0
+        )
+
+        _ = try await memory.synchronizeMemories(
+            conversation: conversation,
+            messages: [
+                ChatMessage(id: "i1", text: "Ping", senderName: "Alex", senderHandle: "alex@example.com", date: .now, direction: .incoming, containsAttachmentPlaceholder: false, isUnsupportedContent: false)
+            ]
+        )
+
+        let userMetadata = try await database.loadDerivedUserProfileMemoryMetadata()
+        let contactMetadata = try await database.loadDerivedContactMemoryMetadata(memoryKey: conversation.memoryKey)
+
+        XCTAssertEqual(userMetadata?.source, .heuristic)
+        XCTAssertEqual(contactMetadata?.source, .heuristic)
+        XCTAssertNotNil(userMetadata?.lastError)
+        XCTAssertNotNil(contactMetadata?.lastError)
     }
 
     func testMemoryEnginePersistsHeuristicSyncMetadataWithoutOpenRouter() async throws {
@@ -867,6 +1130,8 @@ private actor MonitorMessagesStore: MessagesStoreProtocol {
 
     func latestCursor(conversationID: String) async throws -> MonitorCursor? { latest }
 
+    func invalidateContactLabelCaches() async {}
+
     func setLatest(_ latest: MonitorCursor?) {
         self.latest = latest
     }
@@ -929,6 +1194,8 @@ private actor MultiConversationMonitorMessagesStore: MessagesStoreProtocol {
     func fetchConversationCallCounts() -> [String: Int] {
         conversationFetchCounts
     }
+
+    func invalidateContactLabelCaches() async {}
 }
 
 private actor ScriptedMessagesStore: MessagesStoreProtocol {
@@ -955,6 +1222,8 @@ private actor ScriptedMessagesStore: MessagesStoreProtocol {
     func latestCursor(conversationID: String) async throws -> MonitorCursor? {
         nil
     }
+
+    func invalidateContactLabelCaches() async {}
 }
 
 private final class MockOpenRouterURLProtocol: URLProtocol {

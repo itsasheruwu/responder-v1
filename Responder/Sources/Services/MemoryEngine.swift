@@ -18,9 +18,17 @@ actor MemoryEngine: MemoryStoring {
         return mergeUserMemory(manual: manual, derived: derived)
     }
 
+    func loadUserProfileMemoryForPrompt(memoryKey: String) async throws -> UserProfileMemory {
+        let manual = try await database.loadUserProfileMemory()
+        let globalDerived = try await database.loadDerivedUserProfileMemory()
+        let openRouterSlice = try await database.loadDerivedUserOpenRouterSlice(memoryKey: memoryKey) ?? .empty
+        let mergedDerived = mergeUserDerivedLayers(global: globalDerived, contactOpenRouterSlice: openRouterSlice)
+        return mergeUserMemory(manual: manual, derived: mergedDerived)
+    }
+
     func saveUserProfileMemory(_ memory: UserProfileMemory) async throws {
         try await database.saveUserProfileMemory(memory)
-        try await database.appendActivityLog(ActivityLogEntry(category: .startup, message: "Saved user profile memory."))
+        try await database.appendActivityLog(ActivityLogEntry(category: .memory, message: "Saved user profile memory."))
     }
 
     func loadContactMemory(memoryKey: String, conversationID: String) async throws -> ContactMemory {
@@ -31,7 +39,9 @@ actor MemoryEngine: MemoryStoring {
 
     func saveContactMemory(_ memory: ContactMemory, conversationID: String) async throws {
         try await database.saveContactMemory(memory, conversationID: conversationID)
-        try await database.appendActivityLog(ActivityLogEntry(category: .startup, conversationID: conversationID, message: "Saved contact memory."))
+        try await database.appendActivityLog(
+            ActivityLogEntry(category: .memory, conversationID: conversationID, message: "Saved contact memory.")
+        )
     }
 
     func loadSummary(conversationID: String) async throws -> SummarySnapshot {
@@ -50,12 +60,16 @@ actor MemoryEngine: MemoryStoring {
         try await database.saveDraft(draft)
     }
 
-    func synchronizeMemories(conversation: ConversationRef, messages: [ChatMessage]) async throws {
+    @discardableResult
+    func synchronizeMemories(conversation: ConversationRef, messages: [ChatMessage]) async throws -> MemorySyncOutcome {
         let updated = try await applyDerivedMemoryUpdates(conversation: conversation, messages: messages, acceptedDraft: nil)
         if updated.derivedUserMemory != updated.originalDerivedUserMemory {
             try await database.saveDerivedUserProfileMemory(updated.derivedUserMemory)
         }
         try await database.saveDerivedUserProfileMemoryMetadata(updated.userMetadata)
+        if updated.openRouterUserSlice != updated.originalOpenRouterUserSlice {
+            try await database.saveDerivedUserOpenRouterSlice(updated.openRouterUserSlice, memoryKey: conversation.memoryKey)
+        }
         if updated.derivedContactMemory != updated.originalDerivedContactMemory {
             try await database.saveDerivedContactMemory(updated.derivedContactMemory)
         }
@@ -64,9 +78,22 @@ actor MemoryEngine: MemoryStoring {
            let transcriptFingerprint = updated.transcriptFingerprint {
             try await database.saveMemoryTranscriptFingerprint(transcriptFingerprint, conversationID: conversation.id)
         }
+        if let error = updated.openRouterDerivationError {
+            try await database.appendActivityLog(
+                ActivityLogEntry(
+                    category: .memory,
+                    severity: .warning,
+                    conversationID: conversation.id,
+                    message: "OpenRouter memory derivation failed; heuristics still ran.",
+                    metadata: ["error": error]
+                )
+            )
+        }
+        return MemorySyncOutcome(lastOpenRouterDerivationError: updated.openRouterDerivationError)
     }
 
-    func mergeAcceptedDraft(_ draft: ReplyDraft, conversation: ConversationRef, recentMessages: [ChatMessage]) async throws {
+    @discardableResult
+    func mergeAcceptedDraft(_ draft: ReplyDraft, conversation: ConversationRef, recentMessages: [ChatMessage]) async throws -> MemorySyncOutcome {
         let syntheticOutgoing = ChatMessage(
             id: "draft-\(draft.id.uuidString)",
             text: draft.text,
@@ -87,6 +114,9 @@ actor MemoryEngine: MemoryStoring {
             try await database.saveDerivedUserProfileMemory(updated.derivedUserMemory)
         }
         try await database.saveDerivedUserProfileMemoryMetadata(updated.userMetadata)
+        if updated.openRouterUserSlice != updated.originalOpenRouterUserSlice {
+            try await database.saveDerivedUserOpenRouterSlice(updated.openRouterUserSlice, memoryKey: conversation.memoryKey)
+        }
         if updated.derivedContactMemory != updated.originalDerivedContactMemory {
             try await database.saveDerivedContactMemory(updated.derivedContactMemory)
         }
@@ -95,113 +125,337 @@ actor MemoryEngine: MemoryStoring {
            let transcriptFingerprint = updated.transcriptFingerprint {
             try await database.saveMemoryTranscriptFingerprint(transcriptFingerprint, conversationID: conversation.id)
         }
+        if let error = updated.openRouterDerivationError {
+            try await database.appendActivityLog(
+                ActivityLogEntry(
+                    category: .memory,
+                    severity: .warning,
+                    conversationID: conversation.id,
+                    message: "OpenRouter memory derivation failed; heuristics still ran.",
+                    metadata: ["error": error]
+                )
+            )
+        }
+        return MemorySyncOutcome(lastOpenRouterDerivationError: updated.openRouterDerivationError)
+    }
+
+    private struct DerivedMemoryUpdateResult {
+        let originalDerivedUserMemory: UserProfileMemory
+        let originalDerivedContactMemory: ContactMemory
+        let derivedUserMemory: UserProfileMemory
+        let derivedContactMemory: ContactMemory
+        let openRouterUserSlice: UserProfileMemory
+        let originalOpenRouterUserSlice: UserProfileMemory
+        let userMetadata: MemorySyncMetadata
+        let contactMetadata: MemorySyncMetadata
+        let originalTranscriptFingerprint: String?
+        let transcriptFingerprint: String?
+        let openRouterDerivationError: String?
     }
 
     private func applyDerivedMemoryUpdates(
         conversation: ConversationRef,
         messages: [ChatMessage],
         acceptedDraft: ReplyDraft?
-    ) async throws -> (
-        originalDerivedUserMemory: UserProfileMemory,
-        originalDerivedContactMemory: ContactMemory,
-        derivedUserMemory: UserProfileMemory,
-        derivedContactMemory: ContactMemory,
-        userMetadata: MemorySyncMetadata,
-        contactMetadata: MemorySyncMetadata,
-        originalTranscriptFingerprint: String?,
-        transcriptFingerprint: String?
-    ) {
+    ) async throws -> DerivedMemoryUpdateResult {
         let manualUserMemory = try await database.loadUserProfileMemory()
         let manualContactMemory = try await database.loadContactMemory(memoryKey: conversation.memoryKey, conversationID: conversation.id)
         let originalDerivedUserMemory = try await database.loadDerivedUserProfileMemory()
         let originalDerivedContactMemory = try await database.loadDerivedContactMemory(memoryKey: conversation.memoryKey)
-        let mergedUserMemory = mergeUserMemory(manual: manualUserMemory, derived: originalDerivedUserMemory)
+        var openRouterUserSlice = try await database.loadDerivedUserOpenRouterSlice(memoryKey: conversation.memoryKey) ?? .empty
+        let originalOpenRouterUserSlice = openRouterUserSlice
+
+        let nonEmptyTextMessages = messages.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let outgoingMessages = nonEmptyTextMessages.filter { $0.direction == .outgoing }
+        let incomingMessages = nonEmptyTextMessages.filter { $0.direction == .incoming }
+
+        let transcriptMessages = MemoryTranscriptWindow.recentMessagesForDerivation(
+            nonEmptyTextMessages,
+            maxCount: MemoryTranscriptWindow.defaultMaxMessageCount,
+            maxAge: MemoryTranscriptWindow.defaultMaxAge
+        )
+
+        let mergedUserForOpenRouterInput = mergeUserMemory(
+            manual: manualUserMemory,
+            derived: mergeUserDerivedLayers(global: originalDerivedUserMemory, contactOpenRouterSlice: openRouterUserSlice)
+        )
         let mergedContactMemory = mergeContactMemory(manual: manualContactMemory, derived: originalDerivedContactMemory)
+
         var derivedUserMemory = originalDerivedUserMemory
         var derivedContactMemory = originalDerivedContactMemory
-        let outgoingMessages = messages.filter { $0.direction == .outgoing && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        let incomingMessages = messages.filter { $0.direction == .incoming && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        let transcriptMessages = Array((incomingMessages + outgoingMessages).suffix(30))
         let transcriptFingerprint = makeTranscriptFingerprint(from: transcriptMessages)
         let originalTranscriptFingerprint = try await database.loadMemoryTranscriptFingerprint(conversationID: conversation.id)
         let openRouterConfigured = try await hasOpenRouterConfigured()
         var syncSource: MemorySyncSource = acceptedDraft == nil ? .heuristic : .acceptedDraft
+        var openRouterDerivationError: String?
 
-        if openRouterConfigured,
-           originalTranscriptFingerprint != transcriptFingerprint,
-           let derivedMemory = try? await generateDerivedMemoriesWithOpenRouterIfAvailable(
-            conversation: conversation,
-            messages: transcriptMessages,
-            userMemory: mergedUserMemory,
-            contactMemory: mergedContactMemory
-           ) {
-            derivedUserMemory.profileSummary = mergeSummary(existing: derivedUserMemory.profileSummary, candidate: derivedMemory.userProfileSummary)
-            derivedUserMemory.styleTraits = mergeUnique(derivedUserMemory.styleTraits, with: derivedMemory.userStyleTraits, limit: 12)
-            derivedUserMemory.bannedPhrases = mergeUnique(derivedUserMemory.bannedPhrases, with: derivedMemory.userBannedPhrases, limit: 12)
-            derivedUserMemory.backgroundFacts = mergeUnique(derivedUserMemory.backgroundFacts, with: derivedMemory.userBackgroundFacts, limit: 12)
-            derivedUserMemory.replyHabits = mergeUnique(derivedUserMemory.replyHabits, with: derivedMemory.userReplyHabits, limit: 12)
+        let suppressedUserKeys = try await database.suppressedNormalizedKeys(scope: .user, memoryKey: nil)
+        let suppressedContactKeys = try await database.suppressedNormalizedKeys(scope: .contact, memoryKey: conversation.memoryKey)
 
-            derivedContactMemory.relationshipSummary = mergeSummary(
-                existing: derivedContactMemory.relationshipSummary,
-                candidate: derivedMemory.contactRelationshipSummary
-            )
-            derivedContactMemory.preferences = mergeUnique(derivedContactMemory.preferences, with: derivedMemory.contactPreferences, limit: 12)
-            derivedContactMemory.recurringTopics = mergeUnique(derivedContactMemory.recurringTopics, with: derivedMemory.contactRecurringTopics, limit: 12)
-            derivedContactMemory.boundaries = mergeUnique(derivedContactMemory.boundaries, with: derivedMemory.contactBoundaries, limit: 12)
-            derivedContactMemory.notes = mergeUnique(derivedContactMemory.notes, with: derivedMemory.contactNotes, limit: 20)
-            syncSource = .openRouter
+        if openRouterConfigured, originalTranscriptFingerprint != transcriptFingerprint {
+            do {
+                let derivedMemory = try await openRouterClient.deriveMemories(
+                    conversation: conversation,
+                    messages: transcriptMessages,
+                    userMemory: mergedUserForOpenRouterInput,
+                    contactMemory: mergedContactMemory,
+                    configuration: try await database.loadProviderConfiguration()
+                )
+                let sliceKey = conversation.memoryKey
+                let mergedOpenProfile = mergeLLMSummary(
+                    existing: openRouterUserSlice.singleLine(kind: .profileSummary, bucket: .derivedUserOpenRouter),
+                    candidate: derivedMemory.userProfileSummary
+                )
+                let oldOpenProfile = openRouterUserSlice.items.first {
+                    $0.bucket == .derivedUserOpenRouter && $0.kind == .profileSummary && !$0.suppressed
+                }
+                let profileSupersedes: UUID? = {
+                    guard let old = oldOpenProfile else { return nil }
+                    let on = MemoryNormalization.key(for: old.text)
+                    let nn = MemoryNormalization.key(for: mergedOpenProfile)
+                    return (!on.isEmpty && on != nn) ? old.id : nil
+                }()
+                openRouterUserSlice.replaceBucketScalar(
+                    kind: .profileSummary,
+                    bucket: .derivedUserOpenRouter,
+                    memoryKey: sliceKey,
+                    text: mergedOpenProfile,
+                    source: .openRouter,
+                    supersedesItemID: profileSupersedes
+                )
+                openRouterUserSlice.replaceBucketList(
+                    kind: .styleTrait,
+                    bucket: .derivedUserOpenRouter,
+                    memoryKey: sliceKey,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: openRouterUserSlice.strings(kind: .styleTrait, bucket: .derivedUserOpenRouter),
+                        candidates: filterSuppressed(derivedMemory.userStyleTraits, suppressedUserKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+                openRouterUserSlice.replaceBucketList(
+                    kind: .bannedPhrase,
+                    bucket: .derivedUserOpenRouter,
+                    memoryKey: sliceKey,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: openRouterUserSlice.strings(kind: .bannedPhrase, bucket: .derivedUserOpenRouter),
+                        candidates: filterSuppressed(derivedMemory.userBannedPhrases, suppressedUserKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+                openRouterUserSlice.replaceBucketList(
+                    kind: .backgroundFact,
+                    bucket: .derivedUserOpenRouter,
+                    memoryKey: sliceKey,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: openRouterUserSlice.strings(kind: .backgroundFact, bucket: .derivedUserOpenRouter),
+                        candidates: filterSuppressed(derivedMemory.userBackgroundFacts, suppressedUserKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+                openRouterUserSlice.replaceBucketList(
+                    kind: .replyHabit,
+                    bucket: .derivedUserOpenRouter,
+                    memoryKey: sliceKey,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: openRouterUserSlice.strings(kind: .replyHabit, bucket: .derivedUserOpenRouter),
+                        candidates: filterSuppressed(derivedMemory.userReplyHabits, suppressedUserKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+
+                let mergedRel = mergeLLMSummary(
+                    existing: derivedContactMemory.strings(kind: .relationshipSummary, bucket: .derivedContact).first ?? "",
+                    candidate: derivedMemory.contactRelationshipSummary
+                )
+                let oldRel = derivedContactMemory.items.first {
+                    $0.bucket == .derivedContact && $0.kind == .relationshipSummary && !$0.suppressed
+                }
+                let relSupersedes: UUID? = {
+                    guard let old = oldRel else { return nil }
+                    let on = MemoryNormalization.key(for: old.text)
+                    let nn = MemoryNormalization.key(for: mergedRel)
+                    return (!on.isEmpty && on != nn) ? old.id : nil
+                }()
+                derivedContactMemory.replaceBucketScalar(
+                    kind: .relationshipSummary,
+                    bucket: .derivedContact,
+                    text: mergedRel,
+                    source: .openRouter,
+                    supersedesItemID: relSupersedes
+                )
+                derivedContactMemory.replaceBucketList(
+                    kind: .preference,
+                    bucket: .derivedContact,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: derivedContactMemory.strings(kind: .preference, bucket: .derivedContact),
+                        candidates: filterSuppressed(derivedMemory.contactPreferences, suppressedContactKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+                derivedContactMemory.replaceBucketList(
+                    kind: .recurringTopic,
+                    bucket: .derivedContact,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: derivedContactMemory.strings(kind: .recurringTopic, bucket: .derivedContact),
+                        candidates: filterSuppressed(derivedMemory.contactRecurringTopics, suppressedContactKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+                derivedContactMemory.replaceBucketList(
+                    kind: .boundary,
+                    bucket: .derivedContact,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: derivedContactMemory.strings(kind: .boundary, bucket: .derivedContact),
+                        candidates: filterSuppressed(derivedMemory.contactBoundaries, suppressedContactKeys),
+                        limit: 12
+                    ),
+                    source: .openRouter
+                )
+                derivedContactMemory.replaceBucketList(
+                    kind: .note,
+                    bucket: .derivedContact,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: derivedContactMemory.strings(kind: .note, bucket: .derivedContact),
+                        candidates: filterSuppressed(derivedMemory.contactNotes, suppressedContactKeys),
+                        limit: 20
+                    ),
+                    source: .openRouter
+                )
+                syncSource = .openRouter
+            } catch {
+                openRouterDerivationError = error.localizedDescription
+            }
         }
 
-        derivedUserMemory.styleTraits = mergeUnique(derivedUserMemory.styleTraits, with: inferredUserStyleTraits(from: outgoingMessages), limit: 12)
-        derivedUserMemory.replyHabits = mergeUnique(derivedUserMemory.replyHabits, with: inferredReplyHabits(from: outgoingMessages), limit: 12)
-        derivedUserMemory.backgroundFacts = mergeUnique(derivedUserMemory.backgroundFacts, with: inferredStableUserFacts(from: outgoingMessages), limit: 12)
+        derivedUserMemory.replaceBucketList(
+            kind: .styleTrait,
+            bucket: .derivedUserGlobal,
+            memoryKey: nil,
+            values: mergeUniqueDerivedStableFirst(
+                existing: derivedUserMemory.strings(kind: .styleTrait, bucket: .derivedUserGlobal),
+                candidates: filterSuppressed(inferredUserStyleTraits(from: outgoingMessages), suppressedUserKeys),
+                limit: 12
+            ),
+            source: .heuristic
+        )
+        derivedUserMemory.replaceBucketList(
+            kind: .replyHabit,
+            bucket: .derivedUserGlobal,
+            memoryKey: nil,
+            values: mergeUniqueDerivedStableFirst(
+                existing: derivedUserMemory.strings(kind: .replyHabit, bucket: .derivedUserGlobal),
+                candidates: filterSuppressed(inferredReplyHabits(from: outgoingMessages), suppressedUserKeys),
+                limit: 12
+            ),
+            source: .heuristic
+        )
+        derivedUserMemory.replaceBucketList(
+            kind: .backgroundFact,
+            bucket: .derivedUserGlobal,
+            memoryKey: nil,
+            values: mergeUniqueDerivedStableFirst(
+                existing: derivedUserMemory.strings(kind: .backgroundFact, bucket: .derivedUserGlobal),
+                candidates: filterSuppressed(inferredStableUserFacts(from: outgoingMessages), suppressedUserKeys),
+                limit: 12
+            ),
+            source: .heuristic
+        )
 
-        derivedContactMemory.relationshipSummary = inferredRelationshipSummary(
+        let heuristicSamples = MemoryTranscriptWindow.recentMessagesForDerivation(
+            nonEmptyTextMessages,
+            maxCount: 24,
+            maxAge: nil
+        )
+        let inferredRel = inferredRelationshipSummary(
             conversation: conversation,
             incomingMessages: incomingMessages,
             outgoingMessages: outgoingMessages,
-            existingSummary: derivedContactMemory.relationshipSummary
+            heuristicSampleMessages: heuristicSamples,
+            existingSummary: derivedContactMemory.strings(kind: .relationshipSummary, bucket: .derivedContact).first ?? ""
         )
-        derivedContactMemory.notes = mergeUnique(derivedContactMemory.notes, with: inferredContactNotes(from: incomingMessages), limit: 20)
+        derivedContactMemory.replaceBucketScalar(
+            kind: .relationshipSummary,
+            bucket: .derivedContact,
+            text: inferredRel,
+            source: .heuristic
+        )
+        derivedContactMemory.replaceBucketList(
+            kind: .note,
+            bucket: .derivedContact,
+            values: mergeUniqueDerivedStableFirst(
+                existing: derivedContactMemory.strings(kind: .note, bucket: .derivedContact),
+                candidates: filterSuppressed(inferredContactNotes(from: incomingMessages), suppressedContactKeys),
+                limit: 20
+            ),
+            source: .heuristic
+        )
 
         if let acceptedDraft {
             if !acceptedDraft.memoryCandidates.user.isEmpty {
-                derivedUserMemory.replyHabits = mergeUnique(derivedUserMemory.replyHabits, with: acceptedDraft.memoryCandidates.user, limit: 12)
+                derivedUserMemory.replaceBucketList(
+                    kind: .replyHabit,
+                    bucket: .derivedUserGlobal,
+                    memoryKey: nil,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: derivedUserMemory.strings(kind: .replyHabit, bucket: .derivedUserGlobal),
+                        candidates: filterSuppressed(acceptedDraft.memoryCandidates.user, suppressedUserKeys),
+                        limit: 12
+                    ),
+                    source: .acceptedDraft
+                )
             }
             if !acceptedDraft.memoryCandidates.contact.isEmpty {
-                derivedContactMemory.notes = mergeUnique(derivedContactMemory.notes, with: acceptedDraft.memoryCandidates.contact, limit: 20)
+                derivedContactMemory.replaceBucketList(
+                    kind: .note,
+                    bucket: .derivedContact,
+                    values: mergeUniqueDerivedStableFirst(
+                        existing: derivedContactMemory.strings(kind: .note, bucket: .derivedContact),
+                        candidates: filterSuppressed(acceptedDraft.memoryCandidates.contact, suppressedContactKeys),
+                        limit: 20
+                    ),
+                    source: .acceptedDraft
+                )
             }
         }
-        let metadata = MemorySyncMetadata(source: syncSource, syncedAt: .now)
-        return (
-            originalDerivedUserMemory,
-            originalDerivedContactMemory,
-            derivedUserMemory,
-            derivedContactMemory,
-            metadata,
-            metadata,
-            originalTranscriptFingerprint,
-            openRouterConfigured ? transcriptFingerprint : originalTranscriptFingerprint
-        )
-    }
 
-    private func generateDerivedMemoriesWithOpenRouterIfAvailable(
-        conversation: ConversationRef,
-        messages: [ChatMessage],
-        userMemory: UserProfileMemory,
-        contactMemory: ContactMemory
-    ) async throws -> DerivedMemoryResponse? {
-        let configuration = try await database.loadProviderConfiguration()
-        guard !configuration.openRouterAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
+        let syncedAt = Date.now
+        let userMetadata = MemorySyncMetadata(
+            source: syncSource,
+            syncedAt: syncedAt,
+            lastError: openRouterDerivationError
+        )
+        let contactMetadata = MemorySyncMetadata(
+            source: syncSource,
+            syncedAt: syncedAt,
+            lastError: openRouterDerivationError
+        )
+
+        let newFingerprint: String?
+        if openRouterConfigured {
+            newFingerprint = transcriptFingerprint
+        } else {
+            newFingerprint = originalTranscriptFingerprint
         }
 
-        return try await openRouterClient.deriveMemories(
-            conversation: conversation,
-            messages: messages,
-            userMemory: userMemory,
-            contactMemory: contactMemory,
-            configuration: configuration
+        return DerivedMemoryUpdateResult(
+            originalDerivedUserMemory: originalDerivedUserMemory,
+            originalDerivedContactMemory: originalDerivedContactMemory,
+            derivedUserMemory: derivedUserMemory,
+            derivedContactMemory: derivedContactMemory,
+            openRouterUserSlice: openRouterUserSlice,
+            originalOpenRouterUserSlice: originalOpenRouterUserSlice,
+            userMetadata: userMetadata,
+            contactMetadata: contactMetadata,
+            originalTranscriptFingerprint: originalTranscriptFingerprint,
+            transcriptFingerprint: newFingerprint,
+            openRouterDerivationError: openRouterDerivationError
         )
     }
 
@@ -210,10 +464,91 @@ actor MemoryEngine: MemoryStoring {
         return !configuration.openRouterAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private func filterSuppressed(_ candidates: [String], _ suppressed: Set<String>) -> [String] {
+        candidates.filter {
+            let key = MemoryNormalization.key(for: $0)
+            return key.isEmpty || !suppressed.contains(key)
+        }
+    }
+
+    func pinMemoryItem(id: UUID, pinned: Bool) async throws {
+        guard let item = try await database.fetchMemoryItem(id: id) else { return }
+        try await database.setMemoryItemPinned(id: id, pinned: pinned)
+        try await resyncStorage(for: item)
+        try await database.appendActivityLog(
+            ActivityLogEntry(
+                category: .memory,
+                conversationID: item.conversationID,
+                message: pinned ? "Pinned memory item." : "Unpinned memory item.",
+                metadata: ["itemID": id.uuidString, "bucket": item.bucket.rawValue]
+            )
+        )
+    }
+
+    func deleteMemoryItem(id: UUID) async throws {
+        guard let item = try await database.fetchMemoryItem(id: id) else { return }
+        try await database.deleteMemoryItem(id: id)
+        try await resyncStorage(for: item)
+        try await database.appendActivityLog(
+            ActivityLogEntry(
+                category: .memory,
+                severity: .warning,
+                conversationID: item.conversationID,
+                message: "Deleted memory item.",
+                metadata: ["itemID": id.uuidString, "bucket": item.bucket.rawValue]
+            )
+        )
+    }
+
+    func forgetMemoryItem(id: UUID) async throws {
+        guard let item = try await database.fetchMemoryItem(id: id) else { return }
+        try await database.suppressMemoryItem(id: id)
+        try await resyncStorage(for: item)
+        try await database.appendActivityLog(
+            ActivityLogEntry(
+                category: .memory,
+                conversationID: item.conversationID,
+                message: "Marked memory item as forgotten (suppressed for re-derivation).",
+                metadata: ["itemID": id.uuidString, "bucket": item.bucket.rawValue]
+            )
+        )
+    }
+
+    private func resyncStorage(for item: MemoryItem) async throws {
+        switch item.bucket {
+        case .manualUser:
+            let m = try await database.loadUserProfileMemory()
+            try await database.saveUserProfileMemory(m)
+        case .derivedUserGlobal:
+            let m = try await database.loadDerivedUserProfileMemory()
+            try await database.saveDerivedUserProfileMemory(m)
+        case .derivedUserOpenRouter:
+            guard let mk = item.memoryKey else { return }
+            guard let slice = try await database.loadDerivedUserOpenRouterSlice(memoryKey: mk) else { return }
+            try await database.saveDerivedUserOpenRouterSlice(slice, memoryKey: mk)
+        case .manualContact:
+            guard let mk = item.memoryKey else { return }
+            let cid: String
+            if let existing = item.conversationID {
+                cid = existing
+            } else {
+                cid = try await database.loadContactMemoryConversationID(memoryKey: mk) ?? ""
+            }
+            guard !cid.isEmpty else { return }
+            let m = try await database.loadContactMemory(memoryKey: mk, conversationID: cid)
+            try await database.saveContactMemory(m, conversationID: cid)
+        case .derivedContact:
+            guard let mk = item.memoryKey else { return }
+            let m = try await database.loadDerivedContactMemory(memoryKey: mk)
+            try await database.saveDerivedContactMemory(m)
+        }
+    }
+
     private func inferredRelationshipSummary(
         conversation: ConversationRef,
         incomingMessages: [ChatMessage],
         outgoingMessages: [ChatMessage],
+        heuristicSampleMessages: [ChatMessage],
         existingSummary: String
     ) -> String {
         let normalizedExisting = normalize(existingSummary)
@@ -223,7 +558,8 @@ actor MemoryEngine: MemoryStoring {
         let fallback = inferredRelationshipSummaryFallback(
             conversation: conversation,
             incomingMessages: incomingMessages,
-            outgoingMessages: outgoingMessages
+            outgoingMessages: outgoingMessages,
+            samples: heuristicSampleMessages
         )
         return normalize(fallback)
     }
@@ -231,10 +567,9 @@ actor MemoryEngine: MemoryStoring {
     private func inferredRelationshipSummaryFallback(
         conversation: ConversationRef,
         incomingMessages: [ChatMessage],
-        outgoingMessages: [ChatMessage]
+        outgoingMessages: [ChatMessage],
+        samples: [ChatMessage]
     ) -> String {
-        let samples = Array((incomingMessages + outgoingMessages).suffix(24))
-
         if conversation.isGroup {
             let participantNames = conversation.participants.map(\.displayName).filter { !$0.isEmpty }
             if participantNames.isEmpty {
@@ -272,7 +607,7 @@ actor MemoryEngine: MemoryStoring {
 
     private func inferredUserStyleTraits(from messages: [ChatMessage]) -> [String] {
         guard !messages.isEmpty else { return [] }
-        let samples = messages.suffix(24)
+        let samples = Array(messages.suffix(24))
         let shortMessages = samples.filter { $0.text.count <= 55 }.count
         let lowercasedMessages = samples.filter { isMostlyLowercase($0.text) }.count
         let emojiMessages = samples.filter { containsEmoji($0.text) }.count
@@ -288,7 +623,7 @@ actor MemoryEngine: MemoryStoring {
 
     private func inferredReplyHabits(from messages: [ChatMessage]) -> [String] {
         guard !messages.isEmpty else { return [] }
-        let samples = messages.suffix(24)
+        let samples = Array(messages.suffix(24))
         var habits: [String] = []
 
         if samples.filter({ lineCount(in: $0.text) == 1 }).count * 2 >= samples.count {
@@ -304,13 +639,17 @@ actor MemoryEngine: MemoryStoring {
         return habits
     }
 
+    /// Heuristic “self-stated” lines are easy to misfire on random chatter, mixed languages, or PII-shaped text; keep conservative.
     private func inferredStableUserFacts(from messages: [ChatMessage]) -> [String] {
         messages
             .suffix(12)
             .map(\.text)
             .filter { text in
                 let normalized = normalize(text)
-                return normalized.count >= 24 && normalized.count <= 120 && !containsEmoji(normalized)
+                guard normalized.count >= 24, normalized.count <= 120, !containsEmoji(normalized) else { return false }
+                guard isMostlyASCIIContent(normalized) else { return false }
+                guard !containsLikelyPIIShape(normalized) else { return false }
+                return true
             }
             .prefix(3)
             .map { "Recent self-stated detail: \($0)" }
@@ -318,7 +657,7 @@ actor MemoryEngine: MemoryStoring {
 
     private func inferredContactNotes(from messages: [ChatMessage]) -> [String] {
         guard !messages.isEmpty else { return [] }
-        let samples = messages.suffix(24)
+        let samples = Array(messages.suffix(24))
         var notes: [String] = []
 
         if samples.filter({ $0.text.count <= 55 }).count * 2 >= samples.count {
@@ -334,8 +673,8 @@ actor MemoryEngine: MemoryStoring {
         let recentTopics = samples.reversed().lazy
             .map(\.text)
             .map(normalize)
-            .filter { text in
-                text.count >= 8 && text.count <= 120 && !text.hasPrefix("[")
+            .filter { [self] text in
+                text.count >= 8 && text.count <= 120 && !text.hasPrefix("[") && !containsLikelyPIIShape(text)
             }
             .prefix(3)
             .map { "Recent topic: \($0)" }
@@ -348,6 +687,7 @@ actor MemoryEngine: MemoryStoring {
         guard !messages.isEmpty else { return .unknown }
 
         let normalizedTexts = messages.map { normalize($0.text).lowercased() }
+        // English-centric keyword cues (documented limitation for non-English threads).
         let familyScore = keywordScore(in: normalizedTexts, keywords: ["mom", "dad", "mother", "father", "sister", "brother", "grandma", "grandpa", "aunt", "uncle", "cousin", "family"])
         let romanticScore = keywordScore(in: normalizedTexts, keywords: ["love you", "miss you", "babe", "baby", "girlfriend", "boyfriend", "wife", "husband", "partner", "date night"])
         let workScore = keywordScore(in: normalizedTexts, keywords: ["meeting", "calendar", "deadline", "client", "project", "deck", "office", "team", "coworker", "manager", "shift"])
@@ -402,33 +742,83 @@ actor MemoryEngine: MemoryStoring {
         }
     }
 
-    private func mergeUnique(_ existing: [String], with candidates: [String], limit: Int) -> [String] {
+    /// **List cap policy:** preserve primary entries first (manual order before candidates in `mergeUniqueDerivedStableFirst`),
+    /// then add new unique candidates only while room remains. Never drop primary in favor of newcomers via `suffix(limit)`.
+    private func mergeUniqueDerivedStableFirst(existing: [String], candidates: [String], limit: Int) -> [String] {
         var merged: [String] = []
         var seen: Set<String> = []
 
-        for entry in existing + candidates {
+        for entry in existing {
+            let normalized = normalize(entry)
+            guard !normalized.isEmpty else { continue }
+            guard seen.insert(normalized.lowercased()).inserted else { continue }
+            merged.append(normalized)
+            if merged.count >= limit { return merged }
+        }
+
+        for entry in candidates {
+            guard merged.count < limit else { break }
             let normalized = normalize(entry)
             guard !normalized.isEmpty else { continue }
             guard seen.insert(normalized.lowercased()).inserted else { continue }
             merged.append(normalized)
         }
 
-        if merged.count > limit {
-            return Array(merged.suffix(limit))
+        return merged
+    }
+
+    private func mergeLLMSummary(existing: String, candidate: String, maxSentences: Int = 4, maxUTF16Scalars: Int = 480) -> String {
+        let e = normalize(existing)
+        let c = normalize(candidate)
+        if c.isEmpty { return e }
+        if e.isEmpty { return Self.truncateSummary(c, maxSentences: maxSentences, maxUTF16Scalars: maxUTF16Scalars) }
+
+        let eLower = e.lowercased()
+        let cLower = c.lowercased()
+        if cLower == eLower { return e }
+        if eLower.contains(cLower) { return e }
+        if cLower.contains(eLower) { return Self.truncateSummary(c, maxSentences: maxSentences, maxUTF16Scalars: maxUTF16Scalars) }
+
+        let merged = Self.truncateSummary("\(e) \(c)", maxSentences: maxSentences, maxUTF16Scalars: maxUTF16Scalars)
+        return merged
+    }
+
+    private static func truncateSummary(_ text: String, maxSentences: Int, maxUTF16Scalars: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        var chunks = trimmed.components(separatedBy: ". ")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if chunks.count > maxSentences {
+            chunks = Array(chunks.prefix(maxSentences))
+        }
+        var merged = chunks.map { chunk in
+            chunk.hasSuffix(".") || chunk.hasSuffix("!") || chunk.hasSuffix("?") ? chunk : "\(chunk)."
+        }.joined(separator: " ")
+        if merged.count > maxUTF16Scalars {
+            merged = String(merged.prefix(maxUTF16Scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return merged
     }
 
-    private func mergeSummary(existing: String, candidate: String) -> String {
-        let normalizedCandidate = normalize(candidate)
-        if !normalizedCandidate.isEmpty {
-            return normalizedCandidate
-        }
-        return normalize(existing)
-    }
-
     private func normalize(_ text: String) -> String {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isMostlyASCIIContent(_ text: String) -> Bool {
+        let scalars = text.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) }
+        guard !scalars.isEmpty else { return false }
+        let asciiLetters = scalars.filter { ($0.value >= 65 && $0.value <= 90) || ($0.value >= 97 && $0.value <= 122) }.count
+        return asciiLetters * 10 >= scalars.count * 6
+    }
+
+    private func containsLikelyPIIShape(_ text: String) -> Bool {
+        if text.contains("@"), text.contains(".") { return true }
+        let digits = text.filter(\.isNumber).count
+        if digits >= 9 { return true }
+        let pattern = #"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b"#
+        if text.range(of: pattern, options: .regularExpression) != nil { return true }
+        return false
     }
 
     private func containsEmoji(_ text: String) -> Bool {
@@ -462,35 +852,64 @@ actor MemoryEngine: MemoryStoring {
         }.joined(separator: "\n")
     }
 
-    private func mergeUserMemory(manual: UserProfileMemory, derived: UserProfileMemory) -> UserProfileMemory {
+    private func mergeUserDerivedLayers(global: UserProfileMemory, contactOpenRouterSlice: UserProfileMemory) -> UserProfileMemory {
         UserProfileMemory(
-            profileSummary: mergeManualSummary(manual.profileSummary, derived.profileSummary),
-            styleTraits: mergeManualFirst(manual.styleTraits, derived.styleTraits, limit: 12),
-            bannedPhrases: mergeManualFirst(manual.bannedPhrases, derived.bannedPhrases, limit: 12),
-            backgroundFacts: mergeManualFirst(manual.backgroundFacts, derived.backgroundFacts, limit: 12),
-            replyHabits: mergeManualFirst(manual.replyHabits, derived.replyHabits, limit: 12)
+            items: UserProfileMemory.itemsFromLegacyCodableFields(
+                profileSummary: mergeLLMSummary(
+                    existing: global.singleLine(kind: .profileSummary, bucket: .derivedUserGlobal),
+                    candidate: contactOpenRouterSlice.singleLine(kind: .profileSummary, bucket: .derivedUserOpenRouter)
+                ),
+                styleTraits: mergeListsDerivedOnly(
+                    global: global,
+                    slice: contactOpenRouterSlice,
+                    kind: .styleTrait,
+                    limit: 12
+                ),
+                bannedPhrases: mergeListsDerivedOnly(
+                    global: global,
+                    slice: contactOpenRouterSlice,
+                    kind: .bannedPhrase,
+                    limit: 12
+                ),
+                backgroundFacts: mergeListsDerivedOnly(
+                    global: global,
+                    slice: contactOpenRouterSlice,
+                    kind: .backgroundFact,
+                    limit: 12
+                ),
+                replyHabits: mergeListsDerivedOnly(
+                    global: global,
+                    slice: contactOpenRouterSlice,
+                    kind: .replyHabit,
+                    limit: 12
+                ),
+                bucket: .derivedUserGlobal,
+                openRouterMemoryKey: nil
+            )
         )
+    }
+
+    private func mergeListsDerivedOnly(
+        global: UserProfileMemory,
+        slice: UserProfileMemory,
+        kind: MemoryItemKind,
+        limit: Int
+    ) -> [String] {
+        mergeUniqueDerivedStableFirst(
+            existing: global.strings(kind: kind, bucket: .derivedUserGlobal),
+            candidates: slice.strings(kind: kind, bucket: .derivedUserOpenRouter),
+            limit: limit
+        )
+    }
+
+    private func mergeUserMemory(manual: UserProfileMemory, derived: UserProfileMemory) -> UserProfileMemory {
+        UserProfileMemory(items: manual.items + derived.items)
     }
 
     private func mergeContactMemory(manual: ContactMemory, derived: ContactMemory) -> ContactMemory {
-        ContactMemory(
-            memoryKey: manual.memoryKey,
-            relationshipSummary: mergeManualSummary(manual.relationshipSummary, derived.relationshipSummary),
-            preferences: mergeManualFirst(manual.preferences, derived.preferences, limit: 12),
-            recurringTopics: mergeManualFirst(manual.recurringTopics, derived.recurringTopics, limit: 12),
-            boundaries: mergeManualFirst(manual.boundaries, derived.boundaries, limit: 12),
-            notes: mergeManualFirst(manual.notes, derived.notes, limit: 20)
-        )
+        ContactMemory(memoryKey: manual.memoryKey, items: manual.items + derived.items)
     }
 
-    private func mergeManualSummary(_ manual: String, _ derived: String) -> String {
-        let normalizedManual = normalize(manual)
-        return normalizedManual.isEmpty ? normalize(derived) : normalizedManual
-    }
-
-    private func mergeManualFirst(_ manual: [String], _ derived: [String], limit: Int) -> [String] {
-        mergeUnique(manual, with: derived, limit: limit)
-    }
 }
 
 private enum RelationshipCategory: String {

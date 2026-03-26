@@ -13,6 +13,8 @@ protocol MessagesStoreProtocol: Sendable {
     func fetchConversation(id: String) async throws -> ConversationRef?
     func fetchMessages(conversationID: String, limit: Int) async throws -> [ChatMessage]
     func latestCursor(conversationID: String) async throws -> MonitorCursor?
+    /// Clears in-memory conversation/message caches when contact resolution may change (e.g. user grants Contacts access).
+    func invalidateContactLabelCaches() async
 }
 
 protocol MessageSenderProtocol: Sendable {
@@ -27,8 +29,9 @@ protocol ContextManaging: Sendable {
         userMemory: UserProfileMemory,
         contactMemory: ContactMemory,
         summary: SummarySnapshot,
-        contextLimit: Int
-    ) throws -> PromptPacket
+        contextLimit: Int,
+        providerConfiguration: ProviderConfiguration
+    ) async throws -> PromptPacket
 }
 
 protocol Summarizing: Sendable {
@@ -43,6 +46,8 @@ protocol Summarizing: Sendable {
 
 protocol MemoryStoring: Sendable {
     func loadUserProfileMemory() async throws -> UserProfileMemory
+    /// Manual + global heuristic derived + contact-scoped OpenRouter slice (see `derived_user_openrouter_slice:` in `AppDatabase`).
+    func loadUserProfileMemoryForPrompt(memoryKey: String) async throws -> UserProfileMemory
     func saveUserProfileMemory(_ memory: UserProfileMemory) async throws
     func loadContactMemory(memoryKey: String, conversationID: String) async throws -> ContactMemory
     func saveContactMemory(_ memory: ContactMemory, conversationID: String) async throws
@@ -50,8 +55,13 @@ protocol MemoryStoring: Sendable {
     func saveSummary(_ summary: SummarySnapshot) async throws
     func loadDraft(conversationID: String, modelName: String) async throws -> ReplyDraft
     func saveDraft(_ draft: ReplyDraft) async throws
-    func synchronizeMemories(conversation: ConversationRef, messages: [ChatMessage]) async throws
-    func mergeAcceptedDraft(_ draft: ReplyDraft, conversation: ConversationRef, recentMessages: [ChatMessage]) async throws
+    @discardableResult
+    func synchronizeMemories(conversation: ConversationRef, messages: [ChatMessage]) async throws -> MemorySyncOutcome
+    @discardableResult
+    func mergeAcceptedDraft(_ draft: ReplyDraft, conversation: ConversationRef, recentMessages: [ChatMessage]) async throws -> MemorySyncOutcome
+    func pinMemoryItem(id: UUID, pinned: Bool) async throws
+    func deleteMemoryItem(id: UUID) async throws
+    func forgetMemoryItem(id: UUID) async throws
 }
 
 protocol PolicyEvaluating: Sendable {

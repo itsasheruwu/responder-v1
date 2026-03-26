@@ -15,6 +15,7 @@ struct AppContainer {
 
     static func live(database existingDatabase: AppDatabase? = nil) throws -> AppContainer {
         let database = try existingDatabase ?? AppDatabase()
+        Task { await database.ensureAppSettingsJSONExportExists() }
         let llm = RoutingLLMClient(database: database)
         let startupIssues: [String]
         let messagesStore: any MessagesStoreProtocol
@@ -23,13 +24,14 @@ struct AppContainer {
             messagesStore = try MessagesStoreReader(messagesDirectoryAccess: messagesDirectoryAccess)
             startupIssues = []
         } catch {
-            messagesStore = RestrictedMessagesStore(errorMessage: error.localizedDescription)
+            messagesStore = RestrictedMessagesStore()
             startupIssues = [
                 "Messages history is unavailable: \(error.localizedDescription). Grant Full Disk Access or choose the Messages folder if you want local conversation loading."
             ]
         }
         let sender = MessagesSender()
-        let contextManager = ContextManager()
+        let openRouter = OpenRouterClient()
+        let contextManager = ContextManager(openRouter: openRouter)
         let memory = MemoryEngine(database: database)
         let summarizer = Summarizer(ollama: llm, database: database)
         let policy = PolicyEngine(ollama: llm, database: database)
@@ -63,7 +65,8 @@ struct AppContainer {
         let llm = PreviewOllamaClient()
         let messagesStore = PreviewMessagesStore()
         let sender = PreviewMessagesSender()
-        let contextManager = ContextManager()
+        let openRouter = OpenRouterClient()
+        let contextManager = ContextManager(openRouter: openRouter)
         let memory = MemoryEngine(database: database)
         let summarizer = Summarizer(ollama: llm, database: database)
         let policy = PolicyEngine(ollama: llm, database: database)
@@ -155,6 +158,8 @@ actor PreviewMessagesStore: MessagesStoreProtocol {
     func latestCursor(conversationID: String) async throws -> MonitorCursor? {
         MonitorCursor(conversationID: conversationID, lastMessageID: "2", lastMessageDateValue: 2)
     }
+
+    func invalidateContactLabelCaches() async {}
 }
 
 actor PreviewMessagesSender: MessageSenderProtocol {
@@ -162,12 +167,6 @@ actor PreviewMessagesSender: MessageSenderProtocol {
 }
 
 actor RestrictedMessagesStore: MessagesStoreProtocol {
-    private let errorMessage: String
-
-    init(errorMessage: String) {
-        self.errorMessage = errorMessage
-    }
-
     func fetchConversations(limit: Int) async throws -> [ConversationRef] {
         []
     }
@@ -183,4 +182,6 @@ actor RestrictedMessagesStore: MessagesStoreProtocol {
     func latestCursor(conversationID: String) async throws -> MonitorCursor? {
         nil
     }
+
+    func invalidateContactLabelCaches() async {}
 }

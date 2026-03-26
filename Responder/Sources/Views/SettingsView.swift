@@ -73,6 +73,19 @@ struct SettingsSceneView: View {
                             .textFieldStyle(.roundedBorder)
                         TextField("OpenRouter Base URL", text: $model.providerConfiguration.openRouterBaseURL)
                             .textFieldStyle(.roundedBorder)
+                        Toggle(
+                            "Embedding-based memory retrieval",
+                            isOn: $model.providerConfiguration.useEmbeddingMemoryRetrieval
+                        )
+                        .disabled(model.providerConfiguration.openRouterAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .onChange(of: model.providerConfiguration.useEmbeddingMemoryRetrieval) {
+                            Task { await model.saveProviderConfiguration() }
+                        }
+                        TextField("Embedding model id", text: $model.providerConfiguration.memoryEmbeddingModel)
+                            .textFieldStyle(.roundedBorder)
+                        Text("When enabled, recent transcript is embedded via OpenRouter to rank derived memory for prompts (keyword overlap if the call fails). Separate from the chat model above.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                         Text("OpenRouter sends chat context to a routed cloud model. Built-in presets include `openrouter/free` and `nvidia/nemotron-3-super-120b-a12b:free`.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)

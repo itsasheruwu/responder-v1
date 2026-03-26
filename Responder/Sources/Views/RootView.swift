@@ -277,35 +277,45 @@ struct ConversationDetailView: View {
                     }
 
                     ScrollViewReader { proxy in
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 10) {
-                                ForEach(model.messages) { message in
-                                    HStack {
-                                        if message.direction == .outgoing {
-                                            Spacer(minLength: 60)
-                                        }
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(message.senderName)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                            Text(message.text)
-                                                .textSelection(.enabled)
-                                        }
-                                        .padding(10)
-                                        .frame(maxWidth: 420, alignment: .leading)
-                                        .background(message.direction == .outgoing ? Color.accentColor.opacity(0.16) : Color.gray.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-                                        if message.direction == .incoming {
-                                            Spacer(minLength: 60)
+                        Group {
+                            if model.messages.isEmpty {
+                                ContentUnavailableView(
+                                    model.isLoading || model.isUpdatingMemory ? "Loading Messages" : "No Messages Loaded",
+                                    systemImage: model.isLoading || model.isUpdatingMemory ? "ellipsis.message" : "message.badge",
+                                    description: Text(model.statusMessage)
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            } else {
+                                ScrollView {
+                                    LazyVStack(alignment: .leading, spacing: 10) {
+                                        ForEach(model.messages) { message in
+                                            HStack {
+                                                if message.direction == .outgoing {
+                                                    Spacer(minLength: 60)
+                                                }
+                                                VStack(alignment: .leading, spacing: 4) {
+                                                    Text(message.senderName)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                    Text(message.text)
+                                                        .textSelection(.enabled)
+                                                }
+                                                .padding(10)
+                                                .frame(maxWidth: 420, alignment: .leading)
+                                                .background(message.direction == .outgoing ? Color.accentColor.opacity(0.16) : Color.gray.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                                                if message.direction == .incoming {
+                                                    Spacer(minLength: 60)
+                                                }
+                                            }
+                                            .id(message.id)
                                         }
                                     }
-                                    .id(message.id)
                                 }
-                            }
-                            .padding(.vertical, 8)
-                        }
-                        .onChange(of: model.messages.count) {
-                            if let last = model.messages.last?.id {
-                                proxy.scrollTo(last, anchor: .bottom)
+                                .onChange(of: model.messages.count) {
+                                    if let last = model.messages.last?.id {
+                                        proxy.scrollTo(last, anchor: .bottom)
+                                    }
+                                }
                             }
                         }
                     }

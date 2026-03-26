@@ -9,11 +9,25 @@ struct MemoryInspectorView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     MemoryColumnHeader(
                         title: "User Memory",
-                        subtitle: "Manual edits stay local and override derived context when both exist."
+                        subtitle: "Manual edits stay local and override derived context when both exist. OpenRouter-derived user refinements are stored per contact key and merged here when a conversation is active."
                     )
+
+                    if let syncIssue = model.memorySyncLastError ?? model.userMemoryMetadata?.lastError {
+                        Text(syncIssue)
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    }
 
                     MemoryCard(title: "Effective Memory", badge: "Merged", tint: .accentColor) {
                         UserMemoryReadOnlyFields(memory: model.userMemory)
+                        MemoryItemsQuickActions(
+                            items: MemoryItemVisibility.activeItems(model.userMemory.items),
+                            model: model
+                        )
                     }
 
                     MemoryCard(title: "Manual Memory", badge: "Manual", tint: .blue) {
@@ -52,6 +66,10 @@ struct MemoryInspectorView: View {
 
                     MemoryCard(title: "Effective Memory", badge: "Merged", tint: .accentColor) {
                         ContactMemoryReadOnlyFields(memory: model.contactMemory)
+                        MemoryItemsQuickActions(
+                            items: MemoryItemVisibility.activeItems(model.contactMemory.items),
+                            model: model
+                        )
                     }
 
                     MemoryCard(title: "Manual Memory", badge: "Manual", tint: .blue) {
@@ -168,18 +186,90 @@ private struct MemoryCard<Content: View>: View {
     }
 }
 
+private struct MemoryItemsQuickActions: View {
+    let items: [MemoryItem]
+    @Bindable var model: AppModel
+
+    var body: some View {
+        if items.isEmpty {
+            Text("No atomic memory rows (legacy data is shown above).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Items")
+                    .font(.subheadline.weight(.medium))
+                ForEach(items) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(item.text.isEmpty ? "—" : item.text)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                            HStack(spacing: 8) {
+                                Text(item.kind.rawValue)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                Text(item.bucket.rawValue)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                Text(item.source.displayName)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer(minLength: 8)
+                        if item.pinned {
+                            Image(systemName: "pin.fill")
+                                .foregroundStyle(.orange)
+                                .help("Pinned for prompts")
+                        }
+                        Menu {
+                            Button("Pin") {
+                                Task { await model.pinMemoryItem(id: item.id, pinned: true) }
+                            }
+                            Button("Unpin") {
+                                Task { await model.pinMemoryItem(id: item.id, pinned: false) }
+                            }
+                            Button("Wrong / forget (block re-add)", role: .destructive) {
+                                Task { await model.forgetMemoryItem(id: item.id) }
+                            }
+                            Button("Delete…", role: .destructive) {
+                                Task { await model.deleteMemoryItem(id: item.id) }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .accessibilityLabel("Item actions")
+                        }
+                        .menuStyle(.borderlessButton)
+                    }
+                    .padding(10)
+                    .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+                }
+            }
+        }
+    }
+}
+
 private struct MemoryMetadataView: View {
     let metadata: MemorySyncMetadata?
 
     var body: some View {
-        HStack(spacing: 8) {
-            Label(metadata?.source.displayName ?? "Not synced yet", systemImage: "sparkles")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            if let syncedAt = metadata?.syncedAt {
-                Text("Last sync \(syncedAt.formatted(date: .abbreviated, time: .shortened))")
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Label(metadata?.source.displayName ?? "Not synced yet", systemImage: "sparkles")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if let syncedAt = metadata?.syncedAt {
+                    Text("Last sync \(syncedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let err = metadata?.lastError, !err.isEmpty {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
             }
         }
     }

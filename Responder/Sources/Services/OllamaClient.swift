@@ -154,7 +154,8 @@ actor OllamaClient: OllamaClientProtocol {
     }
 
     func classifyRisk(modelName: String, conversation: ConversationRef, messages: [ChatMessage], draft: ReplyDraft) async throws -> PolicyDecision? {
-        let transcript = messages.suffix(8).map {
+        let windowed = MemoryTranscriptWindow.recentMessagesForDerivation(messages, maxCount: 8, maxAge: nil)
+        let transcript = windowed.map {
             "[\($0.direction.rawValue)] \($0.senderName): \($0.text)"
         }.joined(separator: "\n")
 
